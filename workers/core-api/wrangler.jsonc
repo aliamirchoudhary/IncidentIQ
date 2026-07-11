@@ -5,6 +5,20 @@
   "compatibility_date": "2026-07-11",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "INCIDENT_ROOM",
+        "class_name": "IncidentRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["IncidentRoom"]
+    }
+  ],
   "d1_databases": [
     {
       "binding": "incidentiq_db",
