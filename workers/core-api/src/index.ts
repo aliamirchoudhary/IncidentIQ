@@ -4,11 +4,19 @@ import { createIncident, addEvent, getIncident, getReport } from "./ingestion";
 
 export { IncidentRoom };
 
+interface AgentRPC {
+  ping(): Promise<string>;
+}
+
+interface TimelineAgentRPC extends AgentRPC {
+  debugCallLLM(input: string): Promise<unknown>;
+}
+
 interface Env {
-  TIMELINE_AGENT: { ping(): Promise<string>; debugCallLLM(input: string): Promise<unknown> };
-  ROOTCAUSE_AGENT: { ping(): Promise<string> };
-  PREVENTION_AGENT: { ping(): Promise<string> };
-  MODERATOR_AGENT: { ping(): Promise<string> };
+  TIMELINE_AGENT: DurableObjectNamespace;
+  ROOTCAUSE_AGENT: DurableObjectNamespace;
+  PREVENTION_AGENT: DurableObjectNamespace;
+  MODERATOR_AGENT: DurableObjectNamespace;
   INCIDENT_ROOM: DurableObjectNamespace<IncidentRoom>;
   incidentiq_db: D1Database;
 }
@@ -63,15 +71,17 @@ function getOrigin(request: Request): string {
   return "*";
 }
 
-function getAuthUser(request: Request): { id: string } | null {
-  const auth = request.headers.get("Authorization");
-  if (!auth || !auth.startsWith("Bearer ")) return null;
-  return { id: "unknown" };
+function getAuthUser(_request: Request): { id: string } | null {
+  return null;
 }
 
 function getRoom(env: Env, id: string): DurableObjectStub<IncidentRoom> {
   const doId = env.INCIDENT_ROOM.idFromName(id);
   return env.INCIDENT_ROOM.get(doId);
+}
+
+function getAgentStub(ns: DurableObjectNamespace): DurableObjectStub {
+  return ns.get(ns.idFromName("default"));
 }
 
 export default class extends WorkerEntrypoint<Env> {
@@ -144,16 +154,20 @@ export default class extends WorkerEntrypoint<Env> {
     return addCors(jsonError("NOT_FOUND", "Not found", 404), origin);
   }
 
+  private agentStubs(): Array<[string, DurableObjectStub]> {
+    return [
+      ["timeline-agent", getAgentStub(this.env.TIMELINE_AGENT)],
+      ["rootcause-agent", getAgentStub(this.env.ROOTCAUSE_AGENT)],
+      ["prevention-agent", getAgentStub(this.env.PREVENTION_AGENT)],
+      ["moderator-agent", getAgentStub(this.env.MODERATOR_AGENT)],
+    ];
+  }
+
   private async handlePingAll(): Promise<Response> {
     const results: Record<string, string> = {};
-    for (const [name, agent] of Object.entries({
-      "timeline-agent": this.env.TIMELINE_AGENT,
-      "rootcause-agent": this.env.ROOTCAUSE_AGENT,
-      "prevention-agent": this.env.PREVENTION_AGENT,
-      "moderator-agent": this.env.MODERATOR_AGENT,
-    })) {
+    for (const [name, stub] of this.agentStubs()) {
       try {
-        results[name] = await agent.ping();
+        results[name] = await (stub as AgentRPC).ping();
       } catch (err) {
         results[name] = `error: ${err instanceof Error ? err.message : String(err)}`;
       }
@@ -168,7 +182,8 @@ export default class extends WorkerEntrypoint<Env> {
   private async handleDebugCallLLM(url: URL): Promise<Response> {
     const input = url.searchParams.get("input") || "Reply with the single word: pong";
     try {
-      const result = await this.env.TIMELINE_AGENT.debugCallLLM(input);
+      const stub = getAgentStub(this.env.TIMELINE_AGENT) as TimelineAgentRPC;
+      const result = await stub.debugCallLLM(input);
       return json({ data: result });
     } catch (err) {
       return jsonError("RPC_ERROR", err instanceof Error ? err.message : String(err), 500);

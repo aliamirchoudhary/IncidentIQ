@@ -10,6 +10,26 @@
       {
         "name": "INCIDENT_ROOM",
         "class_name": "IncidentRoom"
+      },
+      {
+        "name": "TIMELINE_AGENT",
+        "class_name": "TimelineAgent",
+        "script_name": "timeline-agent"
+      },
+      {
+        "name": "ROOTCAUSE_AGENT",
+        "class_name": "RootCauseAgent",
+        "script_name": "rootcause-agent"
+      },
+      {
+        "name": "PREVENTION_AGENT",
+        "class_name": "PreventionAgent",
+        "script_name": "prevention-agent"
+      },
+      {
+        "name": "MODERATOR_AGENT",
+        "class_name": "ModeratorAgent",
+        "script_name": "moderator-agent"
       }
     ]
   },
@@ -25,11 +45,5 @@
       "database_name": "incidentiq-db",
       "database_id": "beefd2de-56bd-49a8-83a9-80f7c45237e0"
     }
-  ],
-  "services": [
-    { "binding": "TIMELINE_AGENT", "service": "timeline-agent" },
-    { "binding": "ROOTCAUSE_AGENT", "service": "rootcause-agent" },
-    { "binding": "PREVENTION_AGENT", "service": "prevention-agent" },
-    { "binding": "MODERATOR_AGENT", "service": "moderator-agent" }
   ]
 }

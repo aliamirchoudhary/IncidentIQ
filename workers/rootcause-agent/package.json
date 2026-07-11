@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "agents": "^0.17.3",
     "shared": "workspace:*"
   },
   "devDependencies": {

@@ -1,4 +1,4 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
+import { Agent, routeAgentRequest } from "agents";
 import { callLLM, type CallLLMResponse } from "shared";
 
 interface Env {
@@ -7,11 +7,33 @@ interface Env {
   CLOUDFLARE_API_TOKEN?: string;
 }
 
-export default class extends WorkerEntrypoint<Env> {
-  async fetch(): Promise<Response> {
-    return new Response(null, { status: 404 });
-  }
+interface TimelineEventInput {
+  timestamp: string | null;
+  detail: string;
+  source?: string;
+}
 
+export interface TimelineInput {
+  incident_id: string;
+  raw_events: TimelineEventInput[];
+}
+
+interface TimelineEntry {
+  time: string;
+  event: string;
+  confidence: number;
+  note?: string;
+}
+
+export interface TimelineOutput {
+  status: "success" | "failure";
+  timeline?: TimelineEntry[];
+  error?: string;
+  provider_used?: string;
+  route_used?: string;
+}
+
+export class TimelineAgent extends Agent<Env> {
   async ping(): Promise<string> {
     return "pong";
   }
@@ -29,4 +51,22 @@ export default class extends WorkerEntrypoint<Env> {
       },
     });
   }
+
+  async generateTimeline(_input: TimelineInput): Promise<TimelineOutput> {
+    return { status: "failure", error: "not implemented" };
+  }
+
+  /** Placeholder no-op tool for scaffolding — real tool-calling starts in Stage 10 */
+  async statusCorrelator(_service: string): Promise<{ status: string }> {
+    return { status: "unknown" };
+  }
 }
+
+export default {
+  async fetch(request: Request, env: Env) {
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
+  },
+};
