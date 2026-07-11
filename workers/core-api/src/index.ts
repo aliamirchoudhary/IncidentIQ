@@ -5,7 +5,7 @@ import { createIncident, addEvent, getIncident, getReport } from "./ingestion";
 export { IncidentRoom };
 
 interface Env {
-  TIMELINE_AGENT: { ping(): Promise<string> };
+  TIMELINE_AGENT: { ping(): Promise<string>; debugCallLLM(input: string): Promise<unknown> };
   ROOTCAUSE_AGENT: { ping(): Promise<string> };
   PREVENTION_AGENT: { ping(): Promise<string> };
   MODERATOR_AGENT: { ping(): Promise<string> };
@@ -94,6 +94,10 @@ export default class extends WorkerEntrypoint<Env> {
       return addCors(await this.handleDoCreate(), origin);
     }
 
+    if (method === "GET" && path === "/api/v1/debug/call-llm") {
+      return addCors(await this.handleDebugCallLLM(url), origin);
+    }
+
     const doMatch = path.match(/^\/api\/v1\/debug\/do\/([^/]+)$/);
     if (doMatch) {
       const id = doMatch[1];
@@ -159,6 +163,16 @@ export default class extends WorkerEntrypoint<Env> {
       { data: { status: allOk ? "ok" : "degraded", agents: results } },
       allOk ? 200 : 503
     );
+  }
+
+  private async handleDebugCallLLM(url: URL): Promise<Response> {
+    const input = url.searchParams.get("input") || "Reply with the single word: pong";
+    try {
+      const result = await this.env.TIMELINE_AGENT.debugCallLLM(input);
+      return json({ data: result });
+    } catch (err) {
+      return jsonError("RPC_ERROR", err instanceof Error ? err.message : String(err), 500);
+    }
   }
 
   private async handleDoCreate(): Promise<Response> {
