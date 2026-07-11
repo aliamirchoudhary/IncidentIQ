@@ -21,14 +21,16 @@ export interface CallLLMOptions {
 
 export interface CallLLMResult {
   text: string;
-  provider: "gateway" | "gemini" | "openrouter";
+  provider: "gemini" | "openrouter";
+  route: "gateway" | "direct";
   model: string;
 }
 
 export interface CallLLMError {
   ok: false;
   error: string;
-  provider: "gateway" | "gemini" | "openrouter" | null;
+  provider: "gemini" | "openrouter" | null;
+  route: "gateway" | "direct" | null;
 }
 
 export type CallLLMResponse = CallLLMResult | CallLLMError;
@@ -97,7 +99,7 @@ async function tryGateway(
       GATEWAY_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
-    return { text: result.text, provider: "gateway", model: GATEWAY_MODEL };
+    return { text: result.text, provider: "gemini", route: "gateway", model: GATEWAY_MODEL };
   } catch {
     return null;
   }
@@ -114,7 +116,7 @@ async function tryDirectGemini(
       DIRECT_GEMINI_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
-    return { text: result.text, provider: "gemini", model: DIRECT_GEMINI_MODEL };
+    return { text: result.text, provider: "gemini", route: "direct", model: DIRECT_GEMINI_MODEL };
   } catch {
     return null;
   }
@@ -131,7 +133,7 @@ async function tryOpenRouter(
       OPENROUTER_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
-    return { text: result.text, provider: "openrouter", model: OPENROUTER_MODEL };
+    return { text: result.text, provider: "openrouter", route: "direct", model: OPENROUTER_MODEL };
   } catch {
     return null;
   }
@@ -141,7 +143,7 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
   const temperature = opts.temperature ?? DEFAULT_TEMPERATURE;
 
   if (!opts.env.GEMINI_API_KEY) {
-    return { ok: false, error: "GEMINI_API_KEY is required", provider: null };
+    return { ok: false, error: "GEMINI_API_KEY is required", provider: null, route: null };
   }
 
   const result =
@@ -155,5 +157,6 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
     ok: false,
     error: "All LLM providers failed",
     provider: null,
+    route: null,
   };
 }
