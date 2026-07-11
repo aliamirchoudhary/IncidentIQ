@@ -1,0 +1,7 @@
+packages:
+  - "workers/*"
+  - "packages/*"
+  - "client"
+allowBuilds:
+  esbuild: true
+  workerd: true

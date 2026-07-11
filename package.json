@@ -1,0 +1,14 @@
+{
+  "name": "incidentiq",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --parallel -r run dev",
+    "build": "pnpm -r run build",
+    "deploy:agents": "pnpm --filter timeline-agent run deploy && pnpm --filter rootcause-agent run deploy && pnpm --filter prevention-agent run deploy && pnpm --filter moderator-agent run deploy",
+    "deploy:core": "pnpm --filter core-api run deploy",
+    "deploy": "pnpm run deploy:agents && pnpm run deploy:core"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
