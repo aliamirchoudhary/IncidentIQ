@@ -5,6 +5,13 @@
   "compatibility_date": "2026-07-11",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "incidentiq_db",
+      "database_name": "incidentiq-db",
+      "database_id": "beefd2de-56bd-49a8-83a9-80f7c45237e0"
+    }
+  ],
   "services": [
     { "binding": "TIMELINE_AGENT", "service": "timeline-agent" },
     { "binding": "ROOTCAUSE_AGENT", "service": "rootcause-agent" },
