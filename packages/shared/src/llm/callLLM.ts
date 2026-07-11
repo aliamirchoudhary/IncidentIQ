@@ -1,5 +1,7 @@
-const GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
-const GEMINI_MODEL = "gemini-2.5-flash";
+const AI_GATEWAY_BASE = "https://gateway.ai.cloudflare.com/v1/05c934a23d9100d41fc6e9c89ab6cbcb/incidentiq/compat";
+const GATEWAY_MODEL = "google-ai-studio/gemini-2.5-flash";
+const DIRECT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
+const DIRECT_GEMINI_MODEL = "gemini-2.5-flash";
 const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
 const OPENROUTER_MODEL = "openai/gpt-4o-mini";
 const DEFAULT_TEMPERATURE = 0.3;
@@ -13,19 +15,20 @@ export interface CallLLMOptions {
   env: {
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
+    CLOUDFLARE_API_TOKEN?: string;
   };
 }
 
 export interface CallLLMResult {
   text: string;
-  provider: "gemini" | "openrouter";
+  provider: "gateway" | "gemini" | "openrouter";
   model: string;
 }
 
 export interface CallLLMError {
   ok: false;
   error: string;
-  provider: "gemini" | "openrouter" | null;
+  provider: "gateway" | "gemini" | "openrouter" | null;
 }
 
 export type CallLLMResponse = CallLLMResult | CallLLMError;
@@ -45,21 +48,9 @@ async function post(url: string, headers: Record<string, string>, body: unknown,
   }
 }
 
-function chatBody(systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number) {
-  return {
-    model: GEMINI_MODEL,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-    max_tokens: maxTokens,
-    temperature,
-  };
-}
-
 async function callProvider(
   apiBase: string,
-  apiKey: string,
+  headers: Record<string, string>,
   model: string,
   systemPrompt: string,
   userPrompt: string,
@@ -77,7 +68,7 @@ async function callProvider(
     temperature,
   };
 
-  const response = await post(url, { "Authorization": `Bearer ${apiKey}` }, body, TIMEOUT_MS);
+  const response = await post(url, headers, body, TIMEOUT_MS);
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "unknown");
@@ -94,6 +85,58 @@ async function callProvider(
   return { text, raw: json };
 }
 
+async function tryGateway(
+  systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
+  env: { CLOUDFLARE_API_TOKEN?: string },
+): Promise<CallLLMResult | null> {
+  if (!env.CLOUDFLARE_API_TOKEN) return null;
+  try {
+    const result = await callProvider(
+      AI_GATEWAY_BASE,
+      { "Authorization": `Bearer ${env.CLOUDFLARE_API_TOKEN}` },
+      GATEWAY_MODEL,
+      systemPrompt, userPrompt, maxTokens, temperature,
+    );
+    return { text: result.text, provider: "gateway", model: GATEWAY_MODEL };
+  } catch {
+    return null;
+  }
+}
+
+async function tryDirectGemini(
+  systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
+  env: { GEMINI_API_KEY: string },
+): Promise<CallLLMResult | null> {
+  try {
+    const result = await callProvider(
+      DIRECT_GEMINI_BASE,
+      { "Authorization": `Bearer ${env.GEMINI_API_KEY}` },
+      DIRECT_GEMINI_MODEL,
+      systemPrompt, userPrompt, maxTokens, temperature,
+    );
+    return { text: result.text, provider: "gemini", model: DIRECT_GEMINI_MODEL };
+  } catch {
+    return null;
+  }
+}
+
+async function tryOpenRouter(
+  systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
+  env: { OPENROUTER_API_KEY: string },
+): Promise<CallLLMResult | null> {
+  try {
+    const result = await callProvider(
+      OPENROUTER_API_BASE,
+      { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` },
+      OPENROUTER_MODEL,
+      systemPrompt, userPrompt, maxTokens, temperature,
+    );
+    return { text: result.text, provider: "openrouter", model: OPENROUTER_MODEL };
+  } catch {
+    return null;
+  }
+}
+
 export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
   const temperature = opts.temperature ?? DEFAULT_TEMPERATURE;
 
@@ -101,33 +144,16 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
     return { ok: false, error: "GEMINI_API_KEY is required", provider: null };
   }
 
-  try {
-    const result = await callProvider(
-      GEMINI_API_BASE, opts.env.GEMINI_API_KEY, GEMINI_MODEL,
-      opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature,
-    );
-    return { text: result.text, provider: "gemini", model: GEMINI_MODEL };
-  } catch (primaryError) {
-    if (!opts.env.OPENROUTER_API_KEY) {
-      return {
-        ok: false,
-        error: `Gemini failed and no OpenRouter fallback configured: ${primaryError instanceof Error ? primaryError.message : String(primaryError)}`,
-        provider: "gemini",
-      };
-    }
+  const result =
+    (await tryGateway(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env)) ??
+    (await tryDirectGemini(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env)) ??
+    (opts.env.OPENROUTER_API_KEY ? await tryOpenRouter(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env) : null);
 
-    try {
-      const result = await callProvider(
-        OPENROUTER_API_BASE, opts.env.OPENROUTER_API_KEY, OPENROUTER_MODEL,
-        opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature,
-      );
-      return { text: result.text, provider: "openrouter", model: OPENROUTER_MODEL };
-    } catch (fallbackError) {
-      return {
-        ok: false,
-        error: `Gemini: ${primaryError instanceof Error ? primaryError.message : String(primaryError)}. OpenRouter: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
-        provider: null,
-      };
-    }
-  }
+  if (result) return result;
+
+  return {
+    ok: false,
+    error: "All LLM providers failed",
+    provider: null,
+  };
 }

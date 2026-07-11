@@ -4,6 +4,7 @@ import { callLLM, type CallLLMResponse } from "shared";
 interface Env {
   GEMINI_API_KEY: string;
   OPENROUTER_API_KEY?: string;
+  CLOUDFLARE_API_TOKEN?: string;
 }
 
 export default class extends WorkerEntrypoint<Env> {
@@ -24,6 +25,7 @@ export default class extends WorkerEntrypoint<Env> {
       env: {
         GEMINI_API_KEY: this.env.GEMINI_API_KEY,
         OPENROUTER_API_KEY: this.env.OPENROUTER_API_KEY,
+        CLOUDFLARE_API_TOKEN: this.env.CLOUDFLARE_API_TOKEN,
       },
     });
   }
