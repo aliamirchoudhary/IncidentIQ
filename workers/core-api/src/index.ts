@@ -1,6 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { IncidentRoom, type IncidentState } from "./incident-room";
-import { createIncident, addEvent, getIncident, getReport } from "./ingestion";
+import { createIncident, addEvent, getIncident, getReport, logActivity } from "./ingestion";
 
 export { IncidentRoom };
 
@@ -8,8 +8,20 @@ interface AgentRPC {
   ping(): Promise<string>;
 }
 
+interface TimelineEventInput {
+  timestamp: string | null;
+  detail: string;
+  source?: string;
+}
+
+interface TimelineInput {
+  incident_id: string;
+  raw_events: TimelineEventInput[];
+}
+
 interface TimelineAgentRPC extends AgentRPC {
   debugCallLLM(input: string): Promise<unknown>;
+  generateTimeline(input: TimelineInput): Promise<unknown>;
 }
 
 interface Env {
@@ -151,6 +163,11 @@ export default class extends WorkerEntrypoint<Env> {
       return addCors(result, origin);
     }
 
+    const analyzeMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze$/);
+    if (analyzeMatch) {
+      return addCors(await this.handleAnalyze(analyzeMatch[1]), origin);
+    }
+
     return addCors(jsonError("NOT_FOUND", "Not found", 404), origin);
   }
 
@@ -167,7 +184,7 @@ export default class extends WorkerEntrypoint<Env> {
     const results: Record<string, string> = {};
     for (const [name, stub] of this.agentStubs()) {
       try {
-        results[name] = await (stub as AgentRPC).ping();
+        results[name] = await (stub as unknown as AgentRPC).ping();
       } catch (err) {
         results[name] = `error: ${err instanceof Error ? err.message : String(err)}`;
       }
@@ -182,7 +199,7 @@ export default class extends WorkerEntrypoint<Env> {
   private async handleDebugCallLLM(url: URL): Promise<Response> {
     const input = url.searchParams.get("input") || "Reply with the single word: pong";
     try {
-      const stub = getAgentStub(this.env.TIMELINE_AGENT) as TimelineAgentRPC;
+      const stub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
       const result = await stub.debugCallLLM(input);
       return json({ data: result });
     } catch (err) {
@@ -258,6 +275,79 @@ export default class extends WorkerEntrypoint<Env> {
         ),
       },
     });
+  }
+
+  private async handleAnalyze(incidentId: string): Promise<Response> {
+    try {
+      const room = getRoom(this.env, incidentId);
+
+      const incident = await this.env.incidentiq_db.prepare(
+        "SELECT id, title FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string; title: string }>();
+      if (!incident) {
+        return jsonError("NOT_FOUND", "Incident not found", 404);
+      }
+
+      const state: any = await room.getState();
+      if (state.state !== "Ingested") {
+        return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\"", 409);
+      }
+
+      const eventsResult = await this.env.incidentiq_db.prepare(
+        "SELECT timestamp, detail, source FROM incident_events WHERE incident_id = ? ORDER BY created_at ASC"
+      ).bind(incidentId).all();
+
+      const rawEvents = (eventsResult.results ?? []).map((e: any) => ({
+        timestamp: e.timestamp ?? null,
+        detail: e.detail,
+        source: e.source ?? undefined,
+      }));
+
+      const stub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
+      const result: any = await stub.generateTimeline({ incident_id: incidentId, raw_events: rawEvents });
+
+      if (result.status !== "success" || !result.timeline) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
+          state.version, "completed", "failure", result.error ?? "Unknown error",
+        );
+        return jsonError("AGENT_ERROR", result.error ?? "TimelineAgent failed to generate timeline", 500);
+      }
+
+      const now = new Date().toISOString();
+      for (const entry of result.timeline) {
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO timeline_entries (id, incident_id, time, event, confidence, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).bind(crypto.randomUUID(), incidentId, entry.time, entry.event, entry.confidence, entry.note ?? null, now).run();
+      }
+
+      await (room as any).setAgentResult("timeline", result.timeline);
+
+      const transitionResult: any = await room.transition("TimelineDone" as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? "State transition failed", 500);
+      }
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
+        transitionResult.version, "completed", "success",
+        "Timeline generated with " + result.timeline.length + " entries",
+      );
+
+      return json({
+        data: {
+          incidentId,
+          status: "success",
+          state: "TimelineDone",
+          version: transitionResult.version,
+          timeline: result.timeline,
+          provider: result.provider_used ?? null,
+          route: result.route_used ?? null,
+        },
+      }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
   }
 }
 

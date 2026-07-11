@@ -124,7 +124,7 @@ async function tryDirectGemini(
 
 async function tryOpenRouter(
   systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
-  env: { OPENROUTER_API_KEY: string },
+  env: { OPENROUTER_API_KEY?: string },
 ): Promise<CallLLMResult | null> {
   try {
     const result = await callProvider(

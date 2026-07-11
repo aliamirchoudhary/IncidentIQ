@@ -23,7 +23,7 @@ async function deriveIdempotencyKey(body: { timestamp?: string | null; detail: s
   return sha256Hex(`${body.timestamp ?? ""}|${body.detail}|${body.source ?? ""}`);
 }
 
-async function logActivity(
+export async function logActivity(
   db: D1Database,
   incidentId: string,
   agentName: string,
