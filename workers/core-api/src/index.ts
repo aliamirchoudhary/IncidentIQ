@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { IncidentRoom, type IncidentState } from "./incident-room";
+import { createIncident, addEvent, getIncident, getReport } from "./ingestion";
 
 export { IncidentRoom };
 
@@ -9,6 +10,7 @@ interface Env {
   PREVENTION_AGENT: { ping(): Promise<string> };
   MODERATOR_AGENT: { ping(): Promise<string> };
   INCIDENT_ROOM: DurableObjectNamespace<IncidentRoom>;
+  incidentiq_db: D1Database;
 }
 
 interface IncidentDataLoose {
@@ -36,6 +38,37 @@ function jsonError(code: string, message: string, status = 400): Response {
   return json({ error: { code, message } }, status);
 }
 
+function corsHeaders(origin: string): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+
+function addCors(response: Response, origin: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function getOrigin(request: Request): string {
+  const origin = request.headers.get("Origin");
+  if (origin) return origin;
+  const referer = request.headers.get("Referer");
+  if (referer) {
+    try { return new URL(referer).origin; } catch { return "*"; }
+  }
+  return "*";
+}
+
+function getAuthUser(request: Request): { id: string } | null {
+  const auth = request.headers.get("Authorization");
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return { id: "unknown" };
+}
+
 function getRoom(env: Env, id: string): DurableObjectStub<IncidentRoom> {
   const doId = env.INCIDENT_ROOM.idFromName(id);
   return env.INCIDENT_ROOM.get(doId);
@@ -45,31 +78,66 @@ export default class extends WorkerEntrypoint<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method;
+    const origin = getOrigin(request);
 
-    if (method === "GET" && url.pathname === "/api/v1/debug/ping-all") {
-      return this.handlePingAll();
+    if (method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
 
-    if (method === "POST" && url.pathname === "/api/v1/debug/do/create") {
-      return this.handleDoCreate();
+    const path = url.pathname;
+
+    if (method === "GET" && path === "/api/v1/debug/ping-all") {
+      return addCors(await this.handlePingAll(), origin);
     }
 
-    const doMatch = url.pathname.match(/^\/api\/v1\/debug\/do\/([^/]+)$/);
+    if (method === "POST" && path === "/api/v1/debug/do/create") {
+      return addCors(await this.handleDoCreate(), origin);
+    }
+
+    const doMatch = path.match(/^\/api\/v1\/debug\/do\/([^/]+)$/);
     if (doMatch) {
       const id = doMatch[1];
-      if (method === "GET") return this.handleDoGet(id);
+      if (method === "GET") return addCors(await this.handleDoGet(id), origin);
       if (method === "POST") {
         const body = await request.json().catch(() => ({})) as { transition?: string };
-        return this.handleDoTransition(id, body.transition);
+        return addCors(await this.handleDoTransition(id, body.transition), origin);
       }
     }
 
-    const concurrencyMatch = url.pathname.match(/^\/api\/v1\/debug\/do\/([^/]+)\/concurrency-test$/);
+    const concurrencyMatch = path.match(/^\/api\/v1\/debug\/do\/([^/]+)\/concurrency-test$/);
     if (concurrencyMatch && method === "POST") {
-      return this.handleConcurrencyTest(concurrencyMatch[1]);
+      return addCors(await this.handleConcurrencyTest(concurrencyMatch[1]), origin);
     }
 
-    return jsonError("NOT_FOUND", "Not found", 404);
+    // PUBLIC API ROUTES
+
+    if (method === "POST" && path === "/api/v1/incidents") {
+      const body = await request.json().catch(() => ({})) as { title?: string; summary?: string };
+      const result = await createIncident(this.env as any, this.env.incidentiq_db, body, getAuthUser(request));
+      return addCors(result, origin);
+    }
+
+    const eventsMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/events$/);
+    if (eventsMatch) {
+      const incidentId = eventsMatch[1];
+      const body = await request.json().catch(() => ({})) as any;
+      const result = await addEvent(this.env as any, this.env.incidentiq_db, incidentId, body, getAuthUser(request));
+      return addCors(result, origin);
+    }
+
+    const reportMatch = method === "GET" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/report$/);
+    if (reportMatch) {
+      const result = await getReport(this.env as any, this.env.incidentiq_db, reportMatch[1]);
+      return addCors(result, origin);
+    }
+
+    const incidentMatch = method === "GET" && path.match(/^\/api\/v1\/incidents\/([^/]+)$/);
+    if (incidentMatch) {
+      const result = await getIncident(this.env as any, this.env.incidentiq_db, incidentMatch[1]);
+      return addCors(result, origin);
+    }
+
+    return addCors(jsonError("NOT_FOUND", "Not found", 404), origin);
   }
 
   private async handlePingAll(): Promise<Response> {
@@ -167,4 +235,3 @@ export default class extends WorkerEntrypoint<Env> {
 function isValidState(s: string): s is IncidentState {
   return ["Ingested", "TimelineDone", "Validated", "RootCauseDone", "PreventionDone", "AwaitReview", "Finalized"].includes(s);
 }
-

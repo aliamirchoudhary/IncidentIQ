@@ -71,6 +71,10 @@ export class IncidentRoom extends DurableObject {
     }
   }
 
+  async ping(): Promise<boolean> {
+    return true;
+  }
+
   async getState(): Promise<{ state: IncidentState; version: number }> {
     const data = await this.load();
     return { state: data.state, version: data.version };
