@@ -49,6 +49,25 @@ interface RootCauseAgentRPC extends AgentRPC {
   analyzeRootCause(input: RootCauseInput): Promise<RootCauseOutput>;
 }
 
+interface PreventionInput {
+  incident_id: string;
+  root_cause: string;
+  root_cause_evidence: string;
+  retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }>;
+}
+
+interface PreventionOutput {
+  status: string;
+  recommendations?: Array<{ recommendation: string; reference: string | null }>;
+  error?: string;
+  provider_used?: string;
+  route_used?: string;
+}
+
+interface PreventionAgentRPC extends AgentRPC {
+  generatePrevention(input: PreventionInput): Promise<PreventionOutput>;
+}
+
 interface Env {
   TIMELINE_AGENT: DurableObjectNamespace;
   ROOTCAUSE_AGENT: DurableObjectNamespace;
@@ -197,6 +216,11 @@ export default class extends WorkerEntrypoint<Env> {
     const rootcauseMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-rootcause$/);
     if (rootcauseMatch) {
       return addCors(await this.handleRootCause(rootcauseMatch[1]), origin);
+    }
+
+    const preventionMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-prevention$/);
+    if (preventionMatch) {
+      return addCors(await this.handlePrevention(preventionMatch[1]), origin);
     }
 
     // KNOWLEDGE / RAG ROUTES
@@ -556,6 +580,93 @@ export default class extends WorkerEntrypoint<Env> {
           evidence: result.evidence,
           tool_invocations: result.tool_invocations ?? [],
           needs_review: result.needs_review ?? false,
+          retrieved_chunks: retrieved_context.length,
+          provider: result.provider_used ?? null,
+          route: result.route_used ?? null,
+        },
+      }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handlePrevention(incidentId: string): Promise<Response> {
+    try {
+      const room = getRoom(this.env, incidentId);
+      const incident = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string }>();
+      if (!incident) {
+        return jsonError("NOT_FOUND", "Incident not found", 404);
+      }
+
+      const state: any = await room.getState();
+      if (state.state !== "RootCauseDone") {
+        return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "RootCauseDone"`, 409);
+      }
+
+      const rootCauseRow = await this.env.incidentiq_db.prepare(
+        "SELECT cause, evidence FROM root_causes WHERE incident_id = ?"
+      ).bind(incidentId).first<{ cause: string; evidence: string | null }>();
+      if (!rootCauseRow) {
+        return jsonError("CONFLICT", "No root cause found. Run /analyze-rootcause first.", 409);
+      }
+
+      let retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
+      try {
+        const rawContext = await retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3);
+        retrieved_context = rawContext.map((c: any) => ({
+          chunk_id: c.chunkId, title: c.title, content: c.content, score: c.score,
+        }));
+      } catch (err) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          state.version, "completed", "degraded",
+          "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      const stub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
+      const result: PreventionOutput = await stub.generatePrevention({
+        incident_id: incidentId,
+        root_cause: rootCauseRow.cause,
+        root_cause_evidence: rootCauseRow.evidence ?? "",
+        retrieved_context,
+      });
+
+      if (result.status !== "success" || !result.recommendations || result.recommendations.length === 0) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+          state.version, "completed", "failure", result.error ?? "PreventionAgent failed",
+        );
+        return jsonError("AGENT_ERROR", result.error ?? "PreventionAgent failed to generate recommendations", 500);
+      }
+
+      const now = new Date().toISOString();
+      for (const rec of result.recommendations) {
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO recommendations (id, incident_id, recommendation, reference, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference, now).run();
+      }
+
+      const transitionResult: any = await room.transition("PreventionDone" as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? "State transition to PreventionDone failed", 500);
+      }
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+        transitionResult.version, "completed", "success",
+        "Generated " + result.recommendations.length + " recommendations",
+      );
+
+      return json({
+        data: {
+          incidentId,
+          status: "success",
+          state: "PreventionDone",
+          version: transitionResult.version,
+          recommendations: result.recommendations,
           retrieved_chunks: retrieved_context.length,
           provider: result.provider_used ?? null,
           route: result.route_used ?? null,
