@@ -3,6 +3,7 @@ packages:
   - "packages/*"
   - "client"
 allowBuilds:
+  core-js-pure: set this to true or false
   esbuild: true
   sharp: set this to true or false
   workerd: true

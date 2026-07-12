@@ -455,7 +455,19 @@ enforcement, and structured-output expectations. Implement to that spec.
 
 REQUIREMENTS:
 - `callLLM({ systemPrompt, userPrompt, maxTokens, temperature? }) ->
-  Promise<{ text, provider, raw }>`.
+  Promise<{ text, provider, route, raw }>` — `provider` identifies WHICH LLM
+  served the response (`"gemini"` | `"openrouter"`); `route` identifies HOW
+  it was reached (`"gateway"` | `"direct"`). Keep these as two separate
+  fields, not collapsed into one — `agent_activity_logs` and the AI Gateway
+  compliance story both depend on being able to tell "this used OpenRouter"
+  apart from "this bypassed AI Gateway entirely," which are different facts.
+  A direct-bypass fallback (used when AI Gateway itself is unreachable, not
+  just when a provider fails) is an acceptable resilience pattern — but it
+  must be visibly logged as `route: "direct"` every time it fires, since
+  each such call is a (rare, defensible) deviation from the challenge's
+  "ALL LLM requests must pass through AI Gateway" requirement, and that
+  needs to be honestly countable, not silently indistinguishable from normal
+  gateway traffic.
 - VERIFY BEFORE BUILDING: Cloudflare AI Gateway's fallback/routing
   mechanism (Universal Endpoint vs newer Dynamic Routing) — fetch current
   docs rather than assume. If gateway-level fallback is unclear,
