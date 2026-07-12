@@ -26,6 +26,29 @@ interface TimelineAgentRPC extends AgentRPC {
   generateTimeline(input: TimelineInput): Promise<unknown>;
 }
 
+interface RootCauseInput {
+  incident_id: string;
+  timeline: Array<{ time: string; event: string; confidence: number; note?: string }>;
+  retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }>;
+  confidence_threshold_override?: number;
+}
+
+interface RootCauseOutput {
+  status: string;
+  cause?: string;
+  confidence?: number;
+  evidence?: string;
+  tool_invocations?: Array<{ tool: string; input: object; output: object }>;
+  needs_review?: boolean;
+  error?: string;
+  provider_used?: string;
+  route_used?: string;
+}
+
+interface RootCauseAgentRPC extends AgentRPC {
+  analyzeRootCause(input: RootCauseInput): Promise<RootCauseOutput>;
+}
+
 interface Env {
   TIMELINE_AGENT: DurableObjectNamespace;
   ROOTCAUSE_AGENT: DurableObjectNamespace;
@@ -169,6 +192,11 @@ export default class extends WorkerEntrypoint<Env> {
     const analyzeMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze$/);
     if (analyzeMatch) {
       return addCors(await this.handleAnalyze(analyzeMatch[1]), origin);
+    }
+
+    const rootcauseMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-rootcause$/);
+    if (rootcauseMatch) {
+      return addCors(await this.handleRootCause(rootcauseMatch[1]), origin);
     }
 
     // KNOWLEDGE / RAG ROUTES
@@ -424,6 +452,111 @@ export default class extends WorkerEntrypoint<Env> {
           version: transitionResult.version,
           timeline: result.timeline,
           validation,
+          provider: result.provider_used ?? null,
+          route: result.route_used ?? null,
+        },
+      }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleRootCause(incidentId: string): Promise<Response> {
+    try {
+      const room = getRoom(this.env, incidentId);
+      const incident = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string }>();
+      if (!incident) {
+        return jsonError("NOT_FOUND", "Incident not found", 404);
+      }
+
+      const state: any = await room.getState();
+      if (state.state !== "Validated") {
+        return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "Validated"`, 409);
+      }
+
+      const timelineResult = await this.env.incidentiq_db.prepare(
+        "SELECT time, event, confidence, note FROM timeline_entries WHERE incident_id = ? ORDER BY time ASC"
+      ).bind(incidentId).all();
+
+      const timeline = (timelineResult.results ?? []).map((e: any) => ({
+        time: e.time,
+        event: e.event,
+        confidence: e.confidence,
+        note: e.note ?? undefined,
+      }));
+
+      if (timeline.length === 0) {
+        return jsonError("CONFLICT", "No timeline entries found. Run /analyze first.", 409);
+      }
+
+      const queryText = timeline.map((e: any) => e.event).join(" ");
+      let retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
+      try {
+        const rawContext = await retrieveRelevantKnowledge(queryText, this.env.incidentiq_db, this.env.AI, 3);
+        retrieved_context = rawContext.map((c: any) => ({
+          chunk_id: c.chunkId,
+          title: c.title,
+          content: c.content,
+          score: c.score,
+        }));
+      } catch (err) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          state.version, "completed", "degraded",
+          "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      const stub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
+      const result: RootCauseOutput = await stub.analyzeRootCause({
+        incident_id: incidentId,
+        timeline,
+        retrieved_context,
+      });
+
+      if (result.status !== "success" || !result.cause) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+          state.version, "completed", "failure", result.error ?? "RootCauseAgent failed",
+        );
+        return jsonError("AGENT_ERROR", result.error ?? "RootCauseAgent failed to generate root cause", 500);
+      }
+
+      const now = new Date().toISOString();
+      const rootCauseId = crypto.randomUUID();
+      await this.env.incidentiq_db.prepare(
+        "INSERT OR REPLACE INTO root_causes (id, incident_id, cause, confidence, evidence, needs_review, provider_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(
+        rootCauseId, incidentId, result.cause, result.confidence ?? 0,
+        result.evidence ?? null, result.needs_review ? 1 : 0,
+        result.provider_used ?? null, now,
+      ).run();
+
+      const transitionResult: any = await room.transition("RootCauseDone" as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? "State transition to RootCauseDone failed", 500);
+      }
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+        transitionResult.version, "completed", "success",
+        "Root cause: " + result.cause,
+      );
+
+      return json({
+        data: {
+          incidentId,
+          status: "success",
+          state: "RootCauseDone",
+          version: transitionResult.version,
+          cause: result.cause,
+          confidence: result.confidence,
+          evidence: result.evidence,
+          tool_invocations: result.tool_invocations ?? [],
+          needs_review: result.needs_review ?? false,
+          retrieved_chunks: retrieved_context.length,
           provider: result.provider_used ?? null,
           route: result.route_used ?? null,
         },
