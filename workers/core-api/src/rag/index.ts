@@ -1,4 +1,4 @@
-export { ingestDocument, deleteDocumentSource, restoreDocumentSource } from "./ingestion";
+export { ingestDocument, ingestFinalizedIncident, deleteDocumentSource, restoreDocumentSource } from "./ingestion";
 export { retrieveRelevantKnowledge } from "./retrieval";
 export { generateEmbedding } from "./embed";
 export { getSeedDocuments } from "./seed";

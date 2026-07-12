@@ -2,7 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { IncidentRoom, type IncidentState } from "./incident-room";
 import { createIncident, addEvent, getIncident, getReport, logActivity } from "./ingestion";
 import { validateTimeline } from "./validation";
-import { ingestDocument, deleteDocumentSource, restoreDocumentSource, retrieveRelevantKnowledge, getSeedDocuments } from "./rag";
+import { ingestDocument, ingestFinalizedIncident, deleteDocumentSource, restoreDocumentSource, retrieveRelevantKnowledge, getSeedDocuments } from "./rag";
 
 export { IncidentRoom };
 
@@ -225,6 +225,11 @@ export default class extends WorkerEntrypoint<Env> {
       return addCors(result, origin);
     }
 
+    const similarMatch = method === "GET" && path === "/api/v1/incidents/similar";
+    if (similarMatch) {
+      return addCors(await this.handleSimilar(url), origin);
+    }
+
     const incidentMatch = method === "GET" && path.match(/^\/api\/v1\/incidents\/([^/]+)$/);
     if (incidentMatch) {
       const result = await getIncident(this.env as any, this.env.incidentiq_db, incidentMatch[1]);
@@ -238,7 +243,8 @@ export default class extends WorkerEntrypoint<Env> {
 
     const rootcauseMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-rootcause$/);
     if (rootcauseMatch) {
-      return addCors(await this.handleRootCause(rootcauseMatch[1]), origin);
+      const body = await request.json().catch(() => ({})) as any;
+      return addCors(await this.handleRootCause(rootcauseMatch[1], body), origin);
     }
 
     const preventionMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-prevention$/);
@@ -255,6 +261,17 @@ export default class extends WorkerEntrypoint<Env> {
     if (reviewMatch) {
       const body = await request.json().catch(() => ({})) as any;
       return addCors(await this.handleReview(reviewMatch[1], body), origin);
+    }
+
+    const userGetPrefs = method === "GET" && path.match(/^\/api\/v1\/users\/([^/]+)\/preferences$/);
+    if (userGetPrefs) {
+      return addCors(await this.handleGetPreferences(userGetPrefs[1]), origin);
+    }
+
+    const userPutPrefs = method === "PUT" && path.match(/^\/api\/v1\/users\/([^/]+)\/preferences$/);
+    if (userPutPrefs) {
+      const body = await request.json().catch(() => ({})) as any;
+      return addCors(await this.handlePutPreferences(userPutPrefs[1], body), origin);
     }
 
     // KNOWLEDGE / RAG ROUTES
@@ -684,7 +701,7 @@ export default class extends WorkerEntrypoint<Env> {
     }
   }
 
-  private async handleRootCause(incidentId: string): Promise<Response> {
+  private async handleRootCause(incidentId: string, body?: any): Promise<Response> {
     try {
       const room = getRoom(this.env, incidentId);
       const incident = await this.env.incidentiq_db.prepare(
@@ -732,11 +749,27 @@ export default class extends WorkerEntrypoint<Env> {
         );
       }
 
+      let confidenceThresholdOverride: number | undefined;
+      if (body?.user_id) {
+        try {
+          const userRow = await this.env.incidentiq_db.prepare(
+            "SELECT preferences FROM users WHERE id = ?"
+          ).bind(body.user_id).first<{ preferences: string | null }>();
+          if (userRow?.preferences) {
+            const prefs = JSON.parse(userRow.preferences);
+            if (typeof prefs.confidence_threshold_override === "number") {
+              confidenceThresholdOverride = prefs.confidence_threshold_override;
+            }
+          }
+        } catch {}
+      }
+
       const stub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
       const result: RootCauseOutput = await stub.analyzeRootCause({
         incident_id: incidentId,
         timeline,
         retrieved_context,
+        ...(confidenceThresholdOverride !== undefined ? { confidence_threshold_override: confidenceThresholdOverride } : {}),
       });
 
       if (result.status !== "success" || !result.cause) {
@@ -1037,6 +1070,16 @@ export default class extends WorkerEntrypoint<Env> {
             : `Approved by ${body.reviewer_user_id}`,
         );
 
+        this.ctx.waitUntil(
+          ingestFinalizedIncident(incidentId, this.env.incidentiq_db, this.env.AI).catch((err) => {
+            logActivity(
+              this.env.incidentiq_db, incidentId, "KnowledgeIngestion", reviewId,
+              transitionResult.version, "completed", "degraded",
+              "Failed to ingest finalized incident into knowledge base: " + (err instanceof Error ? err.message : String(err)),
+            ).catch(() => {});
+          })
+        );
+
         return json({
           data: {
             incidentId,
@@ -1089,6 +1132,87 @@ export default class extends WorkerEntrypoint<Env> {
           reviewId,
         },
       }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleSimilar(url: URL): Promise<Response> {
+    try {
+      const q = url.searchParams.get("query");
+      if (!q || q.trim().length === 0) {
+        return jsonError("VALIDATION_ERROR", "query parameter 'query' is required", 400);
+      }
+
+      const k = Math.min(Math.max(parseInt(url.searchParams.get("k") ?? "5", 10) || 5, 1), 20);
+      const results = await retrieveRelevantKnowledge(q.trim(), this.env.incidentiq_db, this.env.AI, k);
+
+      const pastIncidents = results.filter((r) => r.type === "past_incident" || r.sourceId !== undefined);
+
+      return json({ data: { query: q, k, results: pastIncidents } });
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleGetPreferences(userId: string): Promise<Response> {
+    try {
+      const user = await this.env.incidentiq_db.prepare(
+        "SELECT id, email, name, preferences FROM users WHERE id = ?"
+      ).bind(userId).first<{ id: string; email: string; name: string; preferences: string | null }>();
+
+      if (!user) {
+        return jsonError("NOT_FOUND", "User not found", 404);
+      }
+
+      let parsed: any = {};
+      if (user.preferences) {
+        try { parsed = JSON.parse(user.preferences); } catch {}
+      }
+
+      return json({
+        data: {
+          userId: user.id,
+          email: user.email,
+          name: user.name,
+          preferences: parsed,
+        },
+      });
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handlePutPreferences(userId: string, body: any): Promise<Response> {
+    try {
+      const user = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM users WHERE id = ?"
+      ).bind(userId).first<{ id: string }>();
+
+      if (!user) {
+        return jsonError("NOT_FOUND", "User not found", 404);
+      }
+
+      const prefs: any = {};
+      if (body.confidence_threshold_override !== undefined) {
+        const val = Number(body.confidence_threshold_override);
+        if (isNaN(val) || val < 0 || val > 1) {
+          return jsonError("VALIDATION_ERROR", "confidence_threshold_override must be a number between 0 and 1", 400);
+        }
+        prefs.confidence_threshold_override = val;
+      }
+      if (body.default_reviewer_name !== undefined) {
+        if (typeof body.default_reviewer_name !== "string" || body.default_reviewer_name.trim().length === 0) {
+          return jsonError("VALIDATION_ERROR", "default_reviewer_name must be a non-empty string", 400);
+        }
+        prefs.default_reviewer_name = body.default_reviewer_name;
+      }
+
+      await this.env.incidentiq_db.prepare(
+        "UPDATE users SET preferences = ?, updated_at = datetime('now') WHERE id = ?"
+      ).bind(JSON.stringify(prefs), userId).run();
+
+      return json({ data: { userId, preferences: prefs } });
     } catch (err) {
       return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
     }
