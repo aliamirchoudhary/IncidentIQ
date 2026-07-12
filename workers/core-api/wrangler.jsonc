@@ -39,6 +39,9 @@
       "new_sqlite_classes": ["IncidentRoom"]
     }
   ],
+  "ai": {
+    "binding": "AI"
+  },
   "d1_databases": [
     {
       "binding": "incidentiq_db",

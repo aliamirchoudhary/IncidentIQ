@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { IncidentRoom, type IncidentState } from "./incident-room";
 import { createIncident, addEvent, getIncident, getReport, logActivity } from "./ingestion";
 import { validateTimeline } from "./validation";
+import { ingestDocument, deleteDocumentSource, restoreDocumentSource, retrieveRelevantKnowledge, getSeedDocuments } from "./rag";
 
 export { IncidentRoom };
 
@@ -32,6 +33,7 @@ interface Env {
   MODERATOR_AGENT: DurableObjectNamespace;
   INCIDENT_ROOM: DurableObjectNamespace<IncidentRoom>;
   incidentiq_db: D1Database;
+  AI: any;
 }
 
 interface IncidentDataLoose {
@@ -167,6 +169,31 @@ export default class extends WorkerEntrypoint<Env> {
     const analyzeMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze$/);
     if (analyzeMatch) {
       return addCors(await this.handleAnalyze(analyzeMatch[1]), origin);
+    }
+
+    // KNOWLEDGE / RAG ROUTES
+
+    if (method === "POST" && path === "/api/v1/knowledge/seed") {
+      return addCors(await this.handleKnowledgeSeed(), origin);
+    }
+
+    if (method === "POST" && path === "/api/v1/knowledge/ingest") {
+      const body = await request.json().catch(() => ({})) as any;
+      return addCors(await this.handleKnowledgeIngest(body), origin);
+    }
+
+    if (method === "GET" && path === "/api/v1/knowledge/query") {
+      return addCors(await this.handleKnowledgeQuery(url), origin);
+    }
+
+    const deleteMatch = method === "DELETE" && path.match(/^\/api\/v1\/knowledge\/sources\/([^/]+)$/);
+    if (deleteMatch) {
+      return addCors(await this.handleKnowledgeDelete(deleteMatch[1]), origin);
+    }
+
+    const restoreMatch = method === "PATCH" && path.match(/^\/api\/v1\/knowledge\/sources\/([^/]+)\/restore$/);
+    if (restoreMatch) {
+      return addCors(await this.handleKnowledgeRestore(restoreMatch[1]), origin);
     }
 
     return addCors(jsonError("NOT_FOUND", "Not found", 404), origin);
@@ -401,6 +428,106 @@ export default class extends WorkerEntrypoint<Env> {
           route: result.route_used ?? null,
         },
       }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleKnowledgeSeed(): Promise<Response> {
+    try {
+      const existing = await this.env.incidentiq_db.prepare(
+        "SELECT COUNT(*) as count FROM knowledge_sources"
+      ).first<{ count: number }>();
+
+      if (existing && existing.count > 0) {
+        return json({ data: { message: "Seed data already exists", existingCount: existing.count } });
+      }
+
+      const docs = getSeedDocuments();
+      const results: Array<{ sourceId: string; chunkCount: number }> = [];
+
+      for (const doc of docs) {
+        const result = await ingestDocument(doc, this.env.incidentiq_db, this.env.AI);
+        results.push(result);
+      }
+
+      return json({
+        data: {
+          message: "Seed data ingested",
+          documents: docs.length,
+          chunks: results.reduce((sum, r) => sum + r.chunkCount, 0),
+          results,
+        },
+      }, 201);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleKnowledgeIngest(body: any): Promise<Response> {
+    if (!body.title || !body.content || !body.type) {
+      return jsonError("VALIDATION_ERROR", "title, type, and content are required", 400);
+    }
+
+    if (body.type !== "runbook" && body.type !== "past_incident") {
+      return jsonError("VALIDATION_ERROR", "type must be 'runbook' or 'past_incident'", 400);
+    }
+
+    try {
+      const result = await ingestDocument({
+        title: body.title,
+        type: body.type,
+        content: body.content,
+        tags: body.tags,
+        source_id: body.source_id,
+      }, this.env.incidentiq_db, this.env.AI);
+
+      return json({ data: result }, 201);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleKnowledgeQuery(url: URL): Promise<Response> {
+    const q = url.searchParams.get("q");
+    if (!q || q.trim().length === 0) {
+      return jsonError("VALIDATION_ERROR", "query parameter 'q' is required", 400);
+    }
+
+    const k = Math.min(Math.max(parseInt(url.searchParams.get("k") ?? "3", 10) || 3, 1), 20);
+
+    try {
+      const results = await retrieveRelevantKnowledge(q.trim(), this.env.incidentiq_db, this.env.AI, k);
+      return json({ data: { query: q, k, results } });
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleKnowledgeDelete(sourceId: string): Promise<Response> {
+    if (!sourceId) return jsonError("VALIDATION_ERROR", "sourceId is required", 400);
+
+    try {
+      const existing = await this.env.incidentiq_db.prepare(
+        "SELECT COUNT(*) as count FROM knowledge_sources WHERE source_id = ? AND deleted_at IS NULL"
+      ).bind(sourceId).first<{ count: number }>();
+
+      if (!existing || existing.count === 0) {
+        return jsonError("NOT_FOUND", "No active knowledge source found with this source_id", 404);
+      }
+
+      await deleteDocumentSource(sourceId, this.env.incidentiq_db);
+
+      return json({ data: { message: "Source soft-deleted", sourceId, chunksAffected: existing.count } });
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleKnowledgeRestore(sourceId: string): Promise<Response> {
+    try {
+      await restoreDocumentSource(sourceId, this.env.incidentiq_db);
+      return json({ data: { message: "Source restored", sourceId } });
     } catch (err) {
       return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
     }
