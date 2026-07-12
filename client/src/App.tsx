@@ -1,40 +1,380 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
+import * as api from "./api";
+import "./App.css";
+
+type Page = "submit" | "timeline" | "review" | "report" | "similar";
 
 export default function App() {
-  const [status, setStatus] = useState<string>("loading...");
-  const [agents, setAgents] = useState<Record<string, string> | null>(null);
+  const [page, setPage] = useState<Page>("submit");
+  const [carryId, setCarryId] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
 
-  useEffect(() => {
-    fetch("/api/v1/debug/ping-all")
-      .then((r) => r.json())
-      .then((body) => {
-        setStatus(body.data?.status ?? "error");
-        setAgents(body.data?.agents ?? null);
-      })
-      .catch((err) => {
-        setStatus(`error: ${err.message}`);
-      });
-  }, []);
+  const showError = (e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e));
+    setLoading(false);
+  };
+
+  const nav = (p: Page) => { setPage(p); setError(""); setStatusMsg(""); };
 
   return (
-    <main style={{ fontFamily: "monospace", padding: "2rem" }}>
-      <h1>IncidentIQ</h1>
-      <p>System status: <strong>{status}</strong></p>
-      {agents && (
-        <table>
-          <thead>
-            <tr><th>Agent</th><th>Response</th></tr>
-          </thead>
-          <tbody>
-            {Object.entries(agents).map(([name, response]) => (
-              <tr key={name}>
-                <td>{name}</td>
-                <td>{response}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+    <div className="app">
+      <header>
+        <h1>IncidentIQ</h1>
+        <nav>
+          <button onClick={() => nav("submit")} className={page === "submit" ? "active" : ""}>Submit</button>
+          <button onClick={() => nav("timeline")} className={page === "timeline" ? "active" : ""}>Timeline</button>
+          <button onClick={() => nav("review")} className={page === "review" ? "active" : ""}>Review</button>
+          <button onClick={() => nav("report")} className={page === "report" ? "active" : ""}>Report</button>
+          <button onClick={() => nav("similar")} className={page === "similar" ? "active" : ""}>Search</button>
+        </nav>
+      </header>
+
+      {error && <div className="error-banner">{error}</div>}
+      {loading && <div className="loading-banner">Loading...</div>}
+      {statusMsg && <div className="status-banner">{statusMsg}</div>}
+
+      <main>
+        {page === "submit" && <SubmitPage onIncidentCreated={(id) => { setCarryId(id); setStatusMsg(`Incident ${id} created`); }} onError={showError} setLoading={setLoading} />}
+        {page === "timeline" && <TimelinePage incidentId={carryId} onError={showError} setLoading={setLoading} setStatus={setStatusMsg} />}
+        {page === "review" && <ReviewPage incidentId={carryId} onError={showError} setLoading={setLoading} setStatus={setStatusMsg} />}
+        {page === "report" && <ReportPage incidentId={carryId} onError={showError} setLoading={setLoading} />}
+        {page === "similar" && <SimilarPage onError={showError} setLoading={setLoading} />}
+      </main>
+    </div>
+  );
+}
+
+function SubmitPage(props: { onIncidentCreated: (id: string) => void; onError: (e: unknown) => void; setLoading: (v: boolean) => void }) {
+  const [title, setTitle] = useState("");
+  const [summary, setSummary] = useState("");
+  const [result, setResult] = useState<api.Incident | null>(null);
+
+  const handleSubmit = async () => {
+    if (!title.trim() || !summary.trim()) { props.onError(new Error("Title and summary are required")); return; }
+    props.setLoading(true);
+    try {
+      const inc = await api.createIncident(title.trim(), summary.trim());
+      setResult(inc);
+      props.onIncidentCreated(inc.id);
+    } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  return (
+    <section className="page">
+      <h2>Submit Incident</h2>
+      <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
+        <label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Brief title" /></label>
+        <label>Summary<textarea value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Describe the incident" rows={4} /></label>
+        <button type="submit">Create Incident</button>
+      </form>
+      {result && (
+        <div className="card">
+          <p><strong>ID:</strong> {result.id}</p>
+          <p><strong>Status:</strong> {result.status}</p>
+        </div>
       )}
-    </main>
+    </section>
+  );
+}
+
+function TimelinePage(props: { incidentId: string; onError: (e: unknown) => void; setLoading: (v: boolean) => void; setStatus: (v: string) => void }) {
+  const [id, setId] = useState(props.incidentId);
+  const [events, setEvents] = useState<{ timestamp: string; detail: string; source: string }[]>([]);
+  const [ts, setTs] = useState("");
+  const [detail, setDetail] = useState("");
+  const [source, setSource] = useState("");
+  const [report, setReport] = useState<api.Report | null>(null);
+
+  const addEvent = () => {
+    if (!detail.trim()) return;
+    setEvents([...events, { timestamp: ts || "", detail: detail.trim(), source: source.trim() || "ui" }]);
+    setTs(""); setDetail(""); setSource("");
+  };
+
+  const doAdd = async () => {
+    if (!id.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+    for (const ev of events) {
+      props.setLoading(true);
+      try { await api.addEvent(id.trim(), ev.timestamp || null, ev.detail, ev.source); } catch (e) { props.onError(e); props.setLoading(false); return; }
+      props.setLoading(false);
+    }
+    props.setStatus(`${events.length} event(s) added`);
+    setEvents([]);
+  };
+
+  const doAnalyze = async () => {
+    if (!id.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+    props.setLoading(true);
+    try {
+      await api.triggerAnalysis(id.trim());
+      props.setStatus("Analysis started, polling...");
+      const poll = async () => {
+        for (let i = 0; i < 30; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            const r = await api.getReport(id.trim());
+            if (r.status === "AwaitReview" || r.status === "Finalized") { setReport(r); props.setStatus(`Done: ${r.status}`); props.setLoading(false); return; }
+          } catch { /* transient */ }
+        }
+        props.setStatus("Polling timed out");
+        props.setLoading(false);
+      };
+      poll();
+    } catch (e) { props.onError(e); props.setLoading(false); }
+  };
+
+  return (
+    <section className="page">
+      <h2>Timeline Entry</h2>
+      <label>Incident ID<input value={id} onChange={(e) => setId(e.target.value)} placeholder="Paste incident ID" /></label>
+      <div className="event-form">
+        <input value={ts} onChange={(e) => setTs(e.target.value)} placeholder="Timestamp (ISO)" />
+        <input value={detail} onChange={(e) => setDetail(e.target.value)} placeholder="Event detail *" />
+        <input value={source} onChange={(e) => setSource(e.target.value)} placeholder="Source" />
+        <button onClick={addEvent}>Add Event</button>
+      </div>
+      {events.length > 0 && (
+        <ul className="event-list">
+          {events.map((e, i) => <li key={i}><strong>{e.timestamp || "?"}</strong> {e.detail} <em>({e.source})</em></li>)}
+        </ul>
+      )}
+      <div className="actions">
+        <button onClick={doAdd} disabled={events.length === 0}>Submit Events</button>
+        <button onClick={doAnalyze}>Trigger Analysis</button>
+      </div>
+      {report && (
+        <div className="card">
+          <p><strong>Status:</strong> {report.status}</p>
+          <p><strong>Timeline:</strong> {report.timeline.length} entries</p>
+          <p><strong>Root Cause:</strong> {report.rootCause?.cause ?? "N/A"}</p>
+          <p><strong>Recommendations:</strong> {report.recommendations.length}</p>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; setLoading: (v: boolean) => void; setStatus: (v: string) => void }) {
+  const [id, setId] = useState(props.incidentId);
+  const [report, setReport] = useState<api.Report | null>(null);
+  const [reviewerId, setReviewerId] = useState("user-1");
+  const [modifications, setModifications] = useState("");
+  const [rejectTarget, setRejectTarget] = useState("RootCauseDone");
+
+  const loadReport = async () => {
+    if (!id.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+    props.setLoading(true);
+    try { setReport(await api.getReport(id.trim())); } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  const doApprove = async () => {
+    if (!id.trim() || !reviewerId.trim()) return;
+    props.setLoading(true);
+    try {
+      await api.submitReview(id.trim(), true, reviewerId.trim(), modifications.trim() || undefined);
+      const r = await api.getReport(id.trim());
+      setReport(r);
+      props.setStatus("Approved! State: " + r.status);
+    } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  const doReject = async () => {
+    if (!id.trim() || !reviewerId.trim()) return;
+    props.setLoading(true);
+    try {
+      await api.rejectReview(id.trim(), reviewerId.trim(), rejectTarget, modifications.trim() || undefined);
+      const r = await api.getReport(id.trim());
+      setReport(r);
+      props.setStatus("Rejected. State: " + r.status);
+    } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  return (
+    <section className="page">
+      <h2>Review Dashboard</h2>
+      <label>Incident ID<input value={id} onChange={(e) => setId(e.target.value)} placeholder="Paste incident ID" /></label>
+      <button onClick={loadReport}>Load Report</button>
+
+      {report && (
+        <>
+          <div className="card">
+            <p><strong>Status:</strong> {report.status} <span className={report.needsReview ? "tag-warn" : "tag-ok"}>{report.needsReview ? "Needs Review" : "Auto-approved"}</span></p>
+            <p><strong>Title:</strong> {report.title}</p>
+          </div>
+
+          <h3>Timeline <span className="tag-ai">AI-generated</span></h3>
+          <table className="data-table">
+            <thead><tr><th>Time</th><th>Event</th><th>Confidence</th></tr></thead>
+            <tbody>
+              {report.timeline.map((t, i) => (
+                <tr key={i} className="ai-row">
+                  <td>{t.time}</td>
+                  <td>{t.event}</td>
+                  <td>{(t.confidence * 100).toFixed(0)}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+
+          {report.rootCause && (
+            <>
+              <h3>Root Cause <span className="tag-ai">AI-generated</span></h3>
+              <div className="card ai-row">
+                <p><strong>Cause:</strong> {report.rootCause.cause}</p>
+                <p><strong>Confidence:</strong> {(report.rootCause.confidence * 100).toFixed(0)}%</p>
+                <p><strong>Evidence:</strong> {report.rootCause.evidence}</p>
+              </div>
+            </>
+          )}
+
+          {report.recommendations.length > 0 && (
+            <>
+              <h3>Recommendations <span className="tag-ai">AI-generated</span></h3>
+              <ul className="rec-list">
+                {report.recommendations.map((r, i) => (
+                  <li key={i} className="ai-row">
+                    <strong>{i + 1}.</strong> {r.recommendation}
+                    {r.reference && <span className="ref"> ({r.reference})</span>}
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+
+          {report.reportSummary && (
+            <>
+              <h3>Report Summary <span className={report.reviews.length > 0 ? "tag-human" : "tag-ai"}>Human-reviewed</span></h3>
+              <div className="card human-row"><pre>{report.reportSummary}</pre></div>
+            </>
+          )}
+
+          {report.reviews.length > 0 && (
+            <>
+              <h3>Review History <span className="tag-human">Human action</span></h3>
+              {report.reviews.map((rv, i) => (
+                <div key={i} className="card human-row">
+                  <p><strong>Reviewer:</strong> {rv.reviewer_user_id}</p>
+                  <p><strong>Action:</strong> {rv.approved ? "Approved" : `Rejected → ${rv.target_state}`}</p>
+                  {rv.modifications && <p><strong>Note:</strong> {rv.modifications}</p>}
+                </div>
+              ))}
+            </>
+          )}
+
+          {report.status === "AwaitReview" && (
+            <div className="review-actions">
+              <h3>Your Decision</h3>
+              <label>Reviewer ID<input value={reviewerId} onChange={(e) => setReviewerId(e.target.value)} /></label>
+              <label>Modification note<textarea value={modifications} onChange={(e) => setModifications(e.target.value)} rows={2} /></label>
+              <div className="button-row">
+                <button className="btn-approve" onClick={doApprove}>Approve</button>
+                <span style={{ margin: "0 8px" }}>or</span>
+                <select value={rejectTarget} onChange={(e) => setRejectTarget(e.target.value)}>
+                  <option value="TimelineDone">Reject → Timeline</option>
+                  <option value="RootCauseDone">Reject → Root Cause</option>
+                  <option value="PreventionDone">Reject → Prevention</option>
+                </select>
+                <button className="btn-reject" onClick={doReject}>Reject</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function ReportPage(props: { incidentId: string; onError: (e: unknown) => void; setLoading: (v: boolean) => void }) {
+  const [id, setId] = useState(props.incidentId);
+  const [report, setReport] = useState<api.Report | null>(null);
+
+  const load = async () => {
+    if (!id.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+    props.setLoading(true);
+    try { setReport(await api.getReport(id.trim())); } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  return (
+    <section className="page">
+      <h2>Report View</h2>
+      <label>Incident ID<input value={id} onChange={(e) => setId(e.target.value)} placeholder="Paste incident ID" /></label>
+      <button onClick={load}>Load Report</button>
+      {report && (
+        <>
+          <div className="card">
+            <h3>{report.title}</h3>
+            <p><strong>Status:</strong> {report.status}</p>
+            <p><strong>Summary:</strong> {report.summary}</p>
+          </div>
+          <h3>Final Timeline</h3>
+          <table className="data-table">
+            <thead><tr><th>Time</th><th>Event</th><th>Confidence</th></tr></thead>
+            <tbody>
+              {report.timeline.map((t, i) => <tr key={i}><td>{t.time}</td><td>{t.event}</td><td>{(t.confidence * 100).toFixed(0)}%</td></tr>)}
+            </tbody>
+          </table>
+          {report.rootCause && (
+            <div className="card"><h4>Root Cause</h4><p>{report.rootCause.cause}</p><p><em>Confidence: {(report.rootCause.confidence * 100).toFixed(0)}%</em></p></div>
+          )}
+          {report.recommendations.length > 0 && (
+            <div className="card"><h4>Recommendations</h4><ul>{report.recommendations.map((r, i) => <li key={i}>{r.recommendation}</li>)}</ul></div>
+          )}
+          {report.reportSummary && <div className="card"><h4>Report Summary</h4><pre>{report.reportSummary}</pre></div>}
+          {report.reviews.length > 0 && (
+            <div className="card"><h4>Reviews</h4>{report.reviews.map((rv, i) => <p key={i}>{rv.reviewer_user_id}: {rv.approved ? "Approved" : "Rejected"}</p>)}</div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function SimilarPage(props: { onError: (e: unknown) => void; setLoading: (v: boolean) => void }) {
+  const [query, setQuery] = useState("");
+  const [k, setK] = useState(5);
+  const [results, setResults] = useState<api.SimilarResult[] | null>(null);
+
+  const search = async () => {
+    if (!query.trim()) { props.onError(new Error("Query is required")); return; }
+    props.setLoading(true);
+    try {
+      const data = await api.searchSimilar(query.trim(), k);
+      setResults(data.results);
+    } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  return (
+    <section className="page">
+      <h2>Similar Incident Search</h2>
+      <div className="search-row">
+        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search query..." className="search-input" />
+        <input type="number" value={k} onChange={(e) => setK(Math.max(1, Math.min(20, Number(e.target.value))))} min={1} max={20} style={{ width: 60 }} />
+        <button onClick={search}>Search</button>
+      </div>
+      {results && results.length === 0 && <p>No results found.</p>}
+      {results && results.length > 0 && (
+        <div className="results-list">
+          {results.map((r, i) => (
+            <div key={i} className="card result-item">
+              <div className="result-header">
+                <strong>{r.title}</strong>
+                <span className={r.type === "past_incident" ? "tag-incident" : "tag-runbook"}>{r.type}</span>
+                <span className="score">{(r.score * 100).toFixed(1)}%</span>
+              </div>
+              <p className="result-content">{r.content.slice(0, 300)}...</p>
+              <p className="result-meta">Source: {r.sourceId}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
