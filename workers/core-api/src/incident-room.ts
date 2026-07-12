@@ -28,6 +28,7 @@ const INITIAL_DATA: IncidentData = {
   rootCause: null,
   prevention: null,
   report: null,
+  validationStatus: null,
 };
 
 interface IncidentData {
@@ -39,6 +40,7 @@ interface IncidentData {
   rootCause: unknown;
   prevention: unknown;
   report: unknown;
+  validationStatus: unknown;
 }
 
 export class IncidentRoom extends DurableObject {
@@ -118,6 +120,12 @@ export class IncidentRoom extends DurableObject {
   async setAgentResult(slot: "timeline" | "rootCause" | "prevention" | "report", value: unknown): Promise<void> {
     const data = await this.load();
     data[slot] = value;
+    await this.save();
+  }
+
+  async setValidationStatus(value: unknown): Promise<void> {
+    const data = await this.load();
+    data.validationStatus = value;
     await this.save();
   }
 }

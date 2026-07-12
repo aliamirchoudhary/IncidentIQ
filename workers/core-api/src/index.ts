@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { IncidentRoom, type IncidentState } from "./incident-room";
 import { createIncident, addEvent, getIncident, getReport, logActivity } from "./ingestion";
+import { validateTimeline } from "./validation";
 
 export { IncidentRoom };
 
@@ -282,16 +283,18 @@ export default class extends WorkerEntrypoint<Env> {
       const room = getRoom(this.env, incidentId);
 
       const incident = await this.env.incidentiq_db.prepare(
-        "SELECT id, title FROM incidents WHERE id = ? AND deleted_at IS NULL"
-      ).bind(incidentId).first<{ id: string; title: string }>();
+        "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string }>();
       if (!incident) {
         return jsonError("NOT_FOUND", "Incident not found", 404);
       }
 
       const state: any = await room.getState();
-      if (state.state !== "Ingested") {
-        return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\"", 409);
+      if (state.state !== "Ingested" && state.state !== "TimelineDone") {
+        return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\" or \"TimelineDone\"", 409);
       }
+
+      const isRetrigger = state.state === "TimelineDone";
 
       const eventsResult = await this.env.incidentiq_db.prepare(
         "SELECT timestamp, detail, source FROM incident_events WHERE incident_id = ? ORDER BY created_at ASC"
@@ -314,6 +317,12 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("AGENT_ERROR", result.error ?? "TimelineAgent failed to generate timeline", 500);
       }
 
+      if (isRetrigger) {
+        await this.env.incidentiq_db.prepare(
+          "DELETE FROM timeline_entries WHERE incident_id = ?"
+        ).bind(incidentId).run();
+      }
+
       const now = new Date().toISOString();
       for (const entry of result.timeline) {
         await this.env.incidentiq_db.prepare(
@@ -323,24 +332,71 @@ export default class extends WorkerEntrypoint<Env> {
 
       await (room as any).setAgentResult("timeline", result.timeline);
 
-      const transitionResult: any = await room.transition("TimelineDone" as IncidentState);
-      if (!transitionResult.success) {
-        return jsonError("INTERNAL", transitionResult.error ?? "State transition failed", 500);
+      let currentVersion = state.version;
+
+      if (!isRetrigger) {
+        const transitionResult: any = await room.transition("TimelineDone" as IncidentState);
+        if (!transitionResult.success) {
+          return jsonError("INTERNAL", transitionResult.error ?? "State transition failed", 500);
+        }
+        currentVersion = transitionResult.version;
       }
 
       await logActivity(
         this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
-        transitionResult.version, "completed", "success",
+        currentVersion, "completed", "success",
         "Timeline generated with " + result.timeline.length + " entries",
+      );
+
+      const validation = validateTimeline(result.timeline, rawEvents);
+
+      if (!validation.valid) {
+        await (room as any).setValidationStatus(validation.issues);
+
+        const issuesSummary = validation.issues.map(i => "- " + i.detail).join("\n");
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+        ).bind(crypto.randomUUID(), incidentId, "agent", issuesSummary, "validation", now).run();
+
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
+          currentVersion, "completed", "invalid",
+          "Validation failed: " + validation.issues.map(i => i.type + ": " + i.detail).join("; "),
+        );
+
+        return json({
+          data: {
+            incidentId,
+            status: "validation_failed",
+            state: "TimelineDone",
+            version: currentVersion,
+            timeline: result.timeline,
+            validation,
+          },
+        }, 200);
+      }
+
+      const transitionResult: any = await room.transition("Validated" as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? "State transition to Validated failed", 500);
+      }
+
+      await (room as any).setValidationStatus(null);
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
+        transitionResult.version, "completed", "valid",
+        "Validation passed: " + result.timeline.length + " timeline entries checked",
       );
 
       return json({
         data: {
           incidentId,
           status: "success",
-          state: "TimelineDone",
+          state: "Validated",
           version: transitionResult.version,
           timeline: result.timeline,
+          validation,
           provider: result.provider_used ?? null,
           route: result.route_used ?? null,
         },
