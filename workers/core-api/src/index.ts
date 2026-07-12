@@ -401,6 +401,24 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\" or \"TimelineDone\"", 409);
       }
 
+      this.ctx.waitUntil(this.runFullChain(incidentId));
+
+      return json({
+        data: {
+          incidentId,
+          status: "processing",
+          state: state.state,
+        },
+      }, 202);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async runFullChain(incidentId: string): Promise<void> {
+    try {
+      const room = getRoom(this.env, incidentId);
+      const state: any = await room.getState();
       const isRetrigger = state.state === "TimelineDone";
 
       const eventsResult = await this.env.incidentiq_db.prepare(
@@ -413,15 +431,16 @@ export default class extends WorkerEntrypoint<Env> {
         source: e.source ?? undefined,
       }));
 
-      const stub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
-      const result: any = await stub.generateTimeline({ incident_id: incidentId, raw_events: rawEvents });
+      // ---- STEP 1: Timeline Agent ----
+      const timelineStub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
+      const timelineResult: any = await timelineStub.generateTimeline({ incident_id: incidentId, raw_events: rawEvents });
 
-      if (result.status !== "success" || !result.timeline) {
+      if (timelineResult.status !== "success" || !timelineResult.timeline) {
         await logActivity(
           this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
-          state.version, "completed", "failure", result.error ?? "Unknown error",
+          state.version, "completed", "failure", timelineResult.error ?? "Unknown error",
         );
-        return jsonError("AGENT_ERROR", result.error ?? "TimelineAgent failed to generate timeline", 500);
+        return;
       }
 
       if (isRetrigger) {
@@ -431,85 +450,231 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       const now = new Date().toISOString();
-      for (const entry of result.timeline) {
+      for (const entry of timelineResult.timeline) {
         await this.env.incidentiq_db.prepare(
           "INSERT INTO timeline_entries (id, incident_id, time, event, confidence, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
         ).bind(crypto.randomUUID(), incidentId, entry.time, entry.event, entry.confidence, entry.note ?? null, now).run();
       }
 
-      await (room as any).setAgentResult("timeline", result.timeline);
+      await (room as any).setAgentResult("timeline", timelineResult.timeline);
 
       let currentVersion = state.version;
-
       if (!isRetrigger) {
-        const transitionResult: any = await room.transition("TimelineDone" as IncidentState);
-        if (!transitionResult.success) {
-          return jsonError("INTERNAL", transitionResult.error ?? "State transition failed", 500);
-        }
-        currentVersion = transitionResult.version;
+        const tResult: any = await room.transition("TimelineDone" as IncidentState);
+        if (tResult.success) currentVersion = tResult.version;
       }
 
       await logActivity(
         this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
         currentVersion, "completed", "success",
-        "Timeline generated with " + result.timeline.length + " entries",
+        "Timeline generated with " + timelineResult.timeline.length + " entries",
       );
 
-      const validation = validateTimeline(result.timeline, rawEvents);
+      // ---- STEP 2: Validation Gate ----
+      const validation = validateTimeline(timelineResult.timeline, rawEvents);
 
       if (!validation.valid) {
         await (room as any).setValidationStatus(validation.issues);
-
-        const issuesSummary = validation.issues.map(i => "- " + i.detail).join("\n");
+        const issuesSummary = validation.issues.map((i: any) => "- " + i.detail).join("\n");
         await this.env.incidentiq_db.prepare(
           "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         ).bind(crypto.randomUUID(), incidentId, "agent", issuesSummary, "validation", now).run();
-
         await logActivity(
           this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
           currentVersion, "completed", "invalid",
-          "Validation failed: " + validation.issues.map(i => i.type + ": " + i.detail).join("; "),
+          "Validation failed: " + validation.issues.map((i: any) => i.type + ": " + i.detail).join("; "),
         );
-
-        return json({
-          data: {
-            incidentId,
-            status: "validation_failed",
-            state: "TimelineDone",
-            version: currentVersion,
-            timeline: result.timeline,
-            validation,
-          },
-        }, 200);
+        return;
       }
 
-      const transitionResult: any = await room.transition("Validated" as IncidentState);
-      if (!transitionResult.success) {
-        return jsonError("INTERNAL", transitionResult.error ?? "State transition to Validated failed", 500);
-      }
-
+      const validatedTransition: any = await room.transition("Validated" as IncidentState);
+      if (!validatedTransition.success) return;
+      currentVersion = validatedTransition.version;
       await (room as any).setValidationStatus(null);
 
       await logActivity(
         this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
-        transitionResult.version, "completed", "valid",
-        "Validation passed: " + result.timeline.length + " timeline entries checked",
+        currentVersion, "completed", "valid",
+        "Validation passed: " + timelineResult.timeline.length + " timeline entries checked",
       );
 
-      return json({
-        data: {
-          incidentId,
-          status: "success",
-          state: "Validated",
-          version: transitionResult.version,
-          timeline: result.timeline,
-          validation,
-          provider: result.provider_used ?? null,
-          route: result.route_used ?? null,
+      // ---- STEP 3: Root Cause Agent ----
+      const timeline = (timelineResult.timeline as Array<any>).map((e: any) => ({
+        time: e.time,
+        event: e.event,
+        confidence: e.confidence,
+        note: e.note ?? undefined,
+      }));
+
+      const queryText = timeline.map((e: any) => e.event).join(" ");
+      let retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
+      try {
+        const rawContext = await retrieveRelevantKnowledge(queryText, this.env.incidentiq_db, this.env.AI, 3);
+        retrieved_context = rawContext.map((c: any) => ({
+          chunk_id: c.chunkId,
+          title: c.title,
+          content: c.content,
+          score: c.score,
+        }));
+      } catch (err) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          currentVersion, "completed", "degraded",
+          "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      const rcStub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
+      const rcResult: RootCauseOutput = await rcStub.analyzeRootCause({
+        incident_id: incidentId, timeline, retrieved_context,
+      });
+
+      if (rcResult.status !== "success" || !rcResult.cause) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+          currentVersion, "completed", "failure", rcResult.error ?? "RootCauseAgent failed",
+        );
+        return;
+      }
+
+      if (isRetrigger) {
+        await this.env.incidentiq_db.prepare(
+          "DELETE FROM root_causes WHERE incident_id = ?"
+        ).bind(incidentId).run();
+      }
+
+      const rootCauseId = crypto.randomUUID();
+      await this.env.incidentiq_db.prepare(
+        "INSERT OR REPLACE INTO root_causes (id, incident_id, cause, confidence, evidence, needs_review, provider_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(
+        rootCauseId, incidentId, rcResult.cause, rcResult.confidence ?? 0,
+        rcResult.evidence ?? null, rcResult.needs_review ? 1 : 0,
+        rcResult.provider_used ?? null, now,
+      ).run();
+
+      const rcTransition: any = await room.transition("RootCauseDone" as IncidentState);
+      if (!rcTransition.success) return;
+      currentVersion = rcTransition.version;
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+        currentVersion, "completed", "success",
+        "Root cause: " + rcResult.cause,
+      );
+
+      // ---- STEP 4: Prevention Agent ----
+      const rootCauseRow = await this.env.incidentiq_db.prepare(
+        "SELECT cause, evidence FROM root_causes WHERE incident_id = ?"
+      ).bind(incidentId).first<{ cause: string; evidence: string | null }>();
+      if (!rootCauseRow) return;
+
+      let preventionContext: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
+      try {
+        const rawPreventionContext = await retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3);
+        preventionContext = rawPreventionContext.map((c: any) => ({
+          chunk_id: c.chunkId,
+          title: c.title,
+          content: c.content,
+          score: c.score,
+        }));
+      } catch (err) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          currentVersion, "completed", "degraded",
+          "Prevention knowledge retrieval degraded: " + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+
+      const prevStub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
+      const prevResult: PreventionOutput = await prevStub.generatePrevention({
+        incident_id: incidentId,
+        root_cause: rootCauseRow.cause,
+        root_cause_evidence: rootCauseRow.evidence ?? "",
+        retrieved_context: preventionContext,
+      });
+
+      if (prevResult.status !== "success" || !prevResult.recommendations) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+          currentVersion, "completed", "failure", prevResult.error ?? "PreventionAgent failed",
+        );
+        return;
+      }
+
+      if (isRetrigger) {
+        await this.env.incidentiq_db.prepare(
+          "DELETE FROM recommendations WHERE incident_id = ?"
+        ).bind(incidentId).run();
+      }
+
+      for (const rec of prevResult.recommendations) {
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO recommendations (id, incident_id, recommendation, reference, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference ?? null, now).run();
+      }
+
+      const prevTransition: any = await room.transition("PreventionDone" as IncidentState);
+      if (!prevTransition.success) return;
+      currentVersion = prevTransition.version;
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+        currentVersion, "completed", "success",
+        prevResult.recommendations.length + " recommendations generated",
+      );
+
+      // ---- STEP 5: Moderator Agent ----
+      const rcFull = await this.env.incidentiq_db.prepare(
+        "SELECT cause, confidence, evidence, needs_review FROM root_causes WHERE incident_id = ?"
+      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>();
+      if (!rcFull) return;
+
+      const recsResult = await this.env.incidentiq_db.prepare(
+        "SELECT recommendation, reference FROM recommendations WHERE incident_id = ? ORDER BY rowid ASC"
+      ).bind(incidentId).all();
+
+      const recommendations = (recsResult.results ?? []).map((r: any) => ({
+        recommendation: r.recommendation,
+        reference: r.reference ?? null,
+      }));
+
+      const modStub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
+      const modResult: ModeratorOutput = await modStub.generateReport({
+        incident_id: incidentId,
+        timeline,
+        root_cause: {
+          cause: rcFull.cause,
+          confidence: rcFull.confidence,
+          evidence: rcFull.evidence ?? "",
+          needs_review: rcFull.needs_review === 1,
         },
-      }, 200);
+        recommendations,
+      });
+
+      if (modResult.status !== "success" || !modResult.report) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+          currentVersion, "completed", "failure", modResult.error ?? "ModeratorAgent failed",
+        );
+        return;
+      }
+
+      await (room as any).setAgentResult("report", modResult.report);
+
+      const modTransition: any = await room.transition("AwaitReview" as IncidentState);
+      if (!modTransition.success) return;
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+        modTransition.version, "completed", "success",
+        "Draft report assembled and ready for review",
+      );
     } catch (err) {
-      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "AutoChain", crypto.randomUUID(),
+        0, "completed", "failure",
+        "Full chain failed: " + (err instanceof Error ? err.message : String(err)),
+      ).catch(() => {});
     }
   }
 
