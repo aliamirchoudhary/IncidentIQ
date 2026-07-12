@@ -68,6 +68,29 @@ interface PreventionAgentRPC extends AgentRPC {
   generatePrevention(input: PreventionInput): Promise<PreventionOutput>;
 }
 
+interface ModeratorInput {
+  incident_id: string;
+  timeline: Array<{ time: string; event: string; confidence: number; note?: string }>;
+  root_cause: { cause: string; confidence: number; evidence: string; needs_review: boolean };
+  recommendations: Array<{ recommendation: string; reference: string | null }>;
+}
+
+interface ModeratorOutput {
+  status: string;
+  report?: {
+    summary: string;
+    timeline: Array<{ time: string; event: string; confidence: number; note?: string }>;
+    root_cause: { cause: string; confidence: number; evidence: string; needs_review: boolean };
+    recommendations: Array<{ recommendation: string; reference: string | null }>;
+    needs_review: boolean;
+  };
+  error?: string;
+}
+
+interface ModeratorAgentRPC extends AgentRPC {
+  generateReport(input: ModeratorInput): Promise<ModeratorOutput>;
+}
+
 interface Env {
   TIMELINE_AGENT: DurableObjectNamespace;
   ROOTCAUSE_AGENT: DurableObjectNamespace;
@@ -221,6 +244,11 @@ export default class extends WorkerEntrypoint<Env> {
     const preventionMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-prevention$/);
     if (preventionMatch) {
       return addCors(await this.handlePrevention(preventionMatch[1]), origin);
+    }
+
+    const moderateMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-moderate$/);
+    if (moderateMatch) {
+      return addCors(await this.handleModerate(moderateMatch[1]), origin);
     }
 
     // KNOWLEDGE / RAG ROUTES
@@ -670,6 +698,101 @@ export default class extends WorkerEntrypoint<Env> {
           retrieved_chunks: retrieved_context.length,
           provider: result.provider_used ?? null,
           route: result.route_used ?? null,
+        },
+      }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleModerate(incidentId: string): Promise<Response> {
+    try {
+      const room = getRoom(this.env, incidentId);
+      const incident = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string }>();
+      if (!incident) {
+        return jsonError("NOT_FOUND", "Incident not found", 404);
+      }
+
+      const state: any = await room.getState();
+      if (state.state !== "PreventionDone") {
+        return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "PreventionDone"`, 409);
+      }
+
+      const timelineResult = await this.env.incidentiq_db.prepare(
+        "SELECT time, event, confidence, note FROM timeline_entries WHERE incident_id = ? ORDER BY time ASC"
+      ).bind(incidentId).all();
+
+      const timeline = (timelineResult.results ?? []).map((e: any) => ({
+        time: e.time,
+        event: e.event,
+        confidence: e.confidence,
+        note: e.note ?? undefined,
+      }));
+
+      if (timeline.length === 0) {
+        return jsonError("CONFLICT", "No timeline entries found. Run /analyze first.", 409);
+      }
+
+      const rootCauseRow = await this.env.incidentiq_db.prepare(
+        "SELECT cause, confidence, evidence, needs_review FROM root_causes WHERE incident_id = ?"
+      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>();
+
+      if (!rootCauseRow) {
+        return jsonError("CONFLICT", "No root cause found. Run /analyze-rootcause first.", 409);
+      }
+
+      const recsResult = await this.env.incidentiq_db.prepare(
+        "SELECT recommendation, reference FROM recommendations WHERE incident_id = ? ORDER BY rowid ASC"
+      ).bind(incidentId).all();
+
+      const recommendations = (recsResult.results ?? []).map((r: any) => ({
+        recommendation: r.recommendation,
+        reference: r.reference ?? null,
+      }));
+
+      const stub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
+      const result: ModeratorOutput = await stub.generateReport({
+        incident_id: incidentId,
+        timeline,
+        root_cause: {
+          cause: rootCauseRow.cause,
+          confidence: rootCauseRow.confidence,
+          evidence: rootCauseRow.evidence ?? "",
+          needs_review: rootCauseRow.needs_review === 1,
+        },
+        recommendations,
+      });
+
+      if (result.status !== "success" || !result.report) {
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+          state.version, "completed", "failure", result.error ?? "ModeratorAgent failed",
+        );
+        return jsonError("AGENT_ERROR", result.error ?? "ModeratorAgent failed to generate report", 500);
+      }
+
+      await (room as any).setAgentResult("report", result.report);
+
+      const transitionResult: any = await room.transition("AwaitReview" as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? "State transition to AwaitReview failed", 500);
+      }
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+        transitionResult.version, "completed", "success",
+        "Draft report assembled and ready for review",
+      );
+
+      return json({
+        data: {
+          incidentId,
+          status: "success",
+          state: "AwaitReview",
+          version: transitionResult.version,
+          report: result.report,
         },
       }, 200);
     } catch (err) {

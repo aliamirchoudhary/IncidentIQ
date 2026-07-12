@@ -231,6 +231,15 @@ export async function getReport(
       "SELECT id, reviewer_user_id, approved, modifications, target_state, created_at FROM reviews WHERE incident_id = ? ORDER BY created_at DESC"
     ).bind(incidentId).all();
 
+    let reportData: any = null;
+    try {
+      const data = await (room as any).getData();
+      if (data && data.report) {
+        reportData = data.report;
+      }
+    } catch {
+    }
+
     return jsonResponse({
       id: incident.id,
       title: incident.title,
@@ -244,6 +253,8 @@ export async function getReport(
       rootCause: rootCause ?? null,
       recommendations: recommendations.results ?? [],
       reviews: reviews.results ?? [],
+      reportSummary: reportData?.summary ?? null,
+      needsReview: reportData?.needs_review ?? (rootCause ? ((rootCause as any).needs_review === 1 || (rootCause as any).needs_review === true) : null),
     });
   } catch (err) {
     return errorResponse("INTERNAL", err instanceof Error ? err.message : "Failed to fetch report", 500);
