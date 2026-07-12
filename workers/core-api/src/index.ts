@@ -251,6 +251,12 @@ export default class extends WorkerEntrypoint<Env> {
       return addCors(await this.handleModerate(moderateMatch[1]), origin);
     }
 
+    const reviewMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/review$/);
+    if (reviewMatch) {
+      const body = await request.json().catch(() => ({})) as any;
+      return addCors(await this.handleReview(reviewMatch[1], body), origin);
+    }
+
     // KNOWLEDGE / RAG ROUTES
 
     if (method === "POST" && path === "/api/v1/knowledge/seed") {
@@ -958,6 +964,129 @@ export default class extends WorkerEntrypoint<Env> {
           state: "AwaitReview",
           version: transitionResult.version,
           report: result.report,
+        },
+      }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleReview(incidentId: string, body: any): Promise<Response> {
+    try {
+      const room = getRoom(this.env, incidentId);
+
+      const incident = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
+      ).bind(incidentId).first<{ id: string }>();
+      if (!incident) {
+        return jsonError("NOT_FOUND", "Incident not found", 404);
+      }
+
+      if (!body.reviewer_user_id || typeof body.reviewer_user_id !== "string") {
+        return jsonError("VALIDATION_ERROR", "reviewer_user_id is required", 400);
+      }
+      if (typeof body.approved !== "boolean") {
+        return jsonError("VALIDATION_ERROR", "approved (boolean) is required", 400);
+      }
+
+      const state: any = await room.getState();
+      if (state.state !== "AwaitReview") {
+        return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "AwaitReview"`, 409);
+      }
+
+      const now = new Date().toISOString();
+      const reviewId = crypto.randomUUID();
+
+      if (body.approved) {
+        const reportData = await (room as any).getData().then((d: any) => d?.report ?? null);
+
+        let reportSummary = reportData?.summary ?? "";
+        if (body.modifications && typeof body.modifications === "string") {
+          reportSummary = body.modifications;
+        }
+        const verifiedLine = `Verified by ${body.reviewer_user_id} on ${now}`;
+        reportSummary = reportSummary ? `${reportSummary}\n\n${verifiedLine}` : verifiedLine;
+
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO reviews (id, incident_id, reviewer_user_id, approved, modifications, target_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).bind(reviewId, incidentId, body.reviewer_user_id, 1, body.modifications ?? null, "Finalized", now).run();
+
+        await this.env.incidentiq_db.prepare(
+          "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+        ).bind(crypto.randomUUID(), incidentId, body.reviewer_user_id,
+          body.modifications
+            ? `Report approved with modifications: ${body.modifications}\n${verifiedLine}`
+            : `Report approved. ${verifiedLine}`,
+          "review", now).run();
+
+        await (room as any).setAgentResult("report", {
+          ...(reportData ?? {}),
+          summary: reportSummary,
+        });
+
+        const transitionResult: any = await room.transition("Finalized" as IncidentState);
+        if (!transitionResult.success) {
+          return jsonError("INTERNAL", transitionResult.error ?? "State transition to Finalized failed", 500);
+        }
+
+        await logActivity(
+          this.env.incidentiq_db, incidentId, "HumanReview", reviewId,
+          transitionResult.version, "completed", "approved",
+          body.modifications
+            ? `Approved with modifications: ${body.modifications}`
+            : `Approved by ${body.reviewer_user_id}`,
+        );
+
+        return json({
+          data: {
+            incidentId,
+            status: "success",
+            action: "approved",
+            state: "Finalized",
+            version: transitionResult.version,
+            reviewId,
+          },
+        }, 200);
+      }
+
+      const targetState: string = body.target_state ?? "RootCauseDone";
+      if (!["TimelineDone", "RootCauseDone", "PreventionDone"].includes(targetState)) {
+        return jsonError("VALIDATION_ERROR", `Invalid target_state "${targetState}". Must be one of: TimelineDone, RootCauseDone, PreventionDone`, 400);
+      }
+
+      await this.env.incidentiq_db.prepare(
+        "INSERT INTO reviews (id, incident_id, reviewer_user_id, approved, modifications, target_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      ).bind(reviewId, incidentId, body.reviewer_user_id, 0, body.modifications ?? null, targetState, now).run();
+
+      await this.env.incidentiq_db.prepare(
+        "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(crypto.randomUUID(), incidentId, body.reviewer_user_id,
+        body.modifications
+          ? `Report rejected. Target state: ${targetState}. Modifications requested: ${body.modifications}`
+          : `Report rejected. Target state: ${targetState}.`,
+        "review", now).run();
+
+      const transitionResult: any = await room.transition(targetState as IncidentState);
+      if (!transitionResult.success) {
+        return jsonError("INTERNAL", transitionResult.error ?? `State transition to ${targetState} failed`, 500);
+      }
+
+      await logActivity(
+        this.env.incidentiq_db, incidentId, "HumanReview", reviewId,
+        transitionResult.version, "completed", "rejected",
+        body.modifications
+          ? `Rejected. Target: ${targetState}. Modifications: ${body.modifications}`
+          : `Rejected by ${body.reviewer_user_id}. Target: ${targetState}`,
+      );
+
+      return json({
+        data: {
+          incidentId,
+          status: "success",
+          action: "rejected",
+          state: targetState,
+          version: transitionResult.version,
+          reviewId,
         },
       }, 200);
     } catch (err) {

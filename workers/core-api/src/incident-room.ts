@@ -15,7 +15,7 @@ const ALLOWED_TRANSITIONS: Record<IncidentState, IncidentState[]> = {
   Validated: ["RootCauseDone"],
   RootCauseDone: ["PreventionDone"],
   PreventionDone: ["AwaitReview"],
-  AwaitReview: ["Finalized"],
+  AwaitReview: ["Finalized", "TimelineDone", "RootCauseDone", "PreventionDone"],
   Finalized: [],
 };
 
