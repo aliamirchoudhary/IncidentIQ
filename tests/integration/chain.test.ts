@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createIncident, addEvent, analyzeIncident, waitForChainCompletion, waitForReport } from "../helpers";
+import { createIncident, addEvent, analyzeIncident, getReport, waitForChainCompletion, waitForReport } from "../helpers";
 
 describe("full analysis chain", () => {
   it("runs the complete chain on a valid incident", async () => {
@@ -35,12 +35,22 @@ describe("full analysis chain", () => {
   }, 300_000);
 
   it("halts at validation when fewer than 2 events are submitted", async () => {
-    const id = await createIncident("Chain Test: Single Event", "Testing validation gate halts the chain");
-    await addEvent(id, "Only one event", "2026-07-13T12:00:00Z");
+    // Verify incident starts fresh before proceeding to avoid test-ordering issues
+    // with parallel file execution against production DOs
+    let id: string;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      id = await createIncident("Chain Test: Single Event", "Testing validation gate halts the chain");
+      const status = await getReport(id);
+      if (status.status === "Ingested") break;
+      // Stale state — retry with a new incident
+      if (attempt === 2) throw new Error(`Could not create fresh incident after 3 attempts. Last status: ${status.status}`);
+    }
 
-    await analyzeIncident(id);
+    await addEvent(id!, "Only one event", "2026-07-13T12:00:00Z");
 
-    const report = await waitForReport(id, 120_000);
+    await analyzeIncident(id!);
+
+    const report = await waitForReport(id!, 120_000);
 
     // Should still be in TimelineDone — chain blocked at validation
     expect(report.status).toBe("TimelineDone");
