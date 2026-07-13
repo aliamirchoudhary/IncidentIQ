@@ -18,6 +18,12 @@
       "tag": "v1",
       "new_sqlite_classes": ["PreventionAgent"]
     }
-  ]
+  ],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
+  }
 }
 

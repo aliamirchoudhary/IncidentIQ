@@ -51,5 +51,11 @@
   ],
   "vars": {
     "ALLOWED_ORIGINS": "http://localhost:5173,http://localhost:8787,http://127.0.0.1:8787,https://incidentiq.pages.dev"
+  },
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true
+    }
   }
 }
