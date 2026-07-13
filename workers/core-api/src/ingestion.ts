@@ -232,13 +232,18 @@ export async function getReport(
     ).bind(incidentId).all();
 
     let reportData: any = null;
+    let rootCauseFromDO: any = null;
     try {
       const data = await (room as any).getData();
-      if (data && data.report) {
-        reportData = data.report;
+      if (data) {
+        reportData = data.report ?? null;
+        rootCauseFromDO = data.rootCause ?? null;
       }
     } catch {
     }
+
+    // Prefer DO state (strongly consistent) over D1 (eventually consistent)
+    const resolvedRootCause = rootCauseFromDO ?? rootCause ?? null;
 
     return jsonResponse({
       id: incident.id,
@@ -250,11 +255,11 @@ export async function getReport(
       updatedAt: incident.updated_at,
       events: events.results ?? [],
       timeline: timeline.results ?? [],
-      rootCause: rootCause ?? null,
+      rootCause: resolvedRootCause,
       recommendations: recommendations.results ?? [],
       reviews: reviews.results ?? [],
       reportSummary: reportData?.summary ?? null,
-      needsReview: reportData?.needs_review ?? (rootCause ? ((rootCause as any).needs_review === 1 || (rootCause as any).needs_review === true) : null),
+      needsReview: reportData?.needs_review ?? (resolvedRootCause ? (resolvedRootCause.needs_review === 1 || resolvedRootCause.needs_review === true) : null),
     });
   } catch (err) {
     return errorResponse("INTERNAL", err instanceof Error ? err.message : "Failed to fetch report", 500);

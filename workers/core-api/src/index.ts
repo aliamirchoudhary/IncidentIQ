@@ -692,6 +692,15 @@ export default class extends WorkerEntrypoint<Env> {
         rcResult.provider_used ?? null, now,
       ).run();
 
+      await (room as any).setAgentResult("rootCause", {
+        id: rootCauseId,
+        cause: rcResult.cause,
+        confidence: rcResult.confidence ?? 0,
+        evidence: rcResult.evidence ?? null,
+        needs_review: rcResult.needs_review ? 1 : 0,
+        provider_used: rcResult.provider_used ?? null,
+      });
+
       const rcTransition: any = await room.transition("RootCauseDone" as IncidentState);
       if (!rcTransition.success) return;
       currentVersion = rcTransition.version;
@@ -938,6 +947,15 @@ export default class extends WorkerEntrypoint<Env> {
         result.evidence ?? null, result.needs_review ? 1 : 0,
         result.provider_used ?? null, now,
       ).run();
+
+      await (room as any).setAgentResult("rootCause", {
+        id: rootCauseId,
+        cause: result.cause,
+        confidence: result.confidence ?? 0,
+        evidence: result.evidence ?? null,
+        needs_review: result.needs_review ? 1 : 0,
+        provider_used: result.provider_used ?? null,
+      });
 
       const transitionResult: any = await room.transition("RootCauseDone" as IncidentState);
       if (!transitionResult.success) {
