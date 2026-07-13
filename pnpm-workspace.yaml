@@ -4,7 +4,7 @@ packages:
   - "client"
   - "tests"
 allowBuilds:
-  core-js-pure: set this to true or false
+  core-js-pure: true
   esbuild: true
-  sharp: set this to true or false
+  sharp: true
   workerd: true
