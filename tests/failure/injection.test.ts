@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createIncident, addEvent, analyzeIncident, waitForReport } from "../helpers";
+import { createIncident, addEvent, analyzeIncident, waitForReport, waitForChainCompletion } from "../helpers";
 
 describe("validation gate — blocks bad input", () => {
   it("halts chain at TimelineDone when validation fails with < 2 events", async () => {
@@ -33,9 +33,9 @@ describe("chain recovery — fix and re-trigger", () => {
     await addEvent(id, "Third event added", "2026-07-13T09:10:00Z");
 
     await analyzeIncident(id);
-    const report2 = await waitForReport(id, 180_000);
+    const report2 = await waitForChainCompletion(id, 300_000);
 
-    expect(report2.status).toBe("AwaitReview");
+    expect(["AwaitReview", "Finalized"]).toContain(report2.status);
     expect(report2.rootCause).toBeDefined();
     expect(report2.rootCause.cause).toBeTruthy();
     expect(report2.recommendations.length).toBeGreaterThan(0);

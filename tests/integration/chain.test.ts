@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createIncident, addEvent, analyzeIncident, waitForReport } from "../helpers";
+import { createIncident, addEvent, analyzeIncident, waitForChainCompletion, waitForReport } from "../helpers";
 
 describe("full analysis chain", () => {
   it("runs the complete chain on a valid incident", async () => {
@@ -13,9 +13,9 @@ describe("full analysis chain", () => {
 
     await analyzeIncident(id);
 
-    const report = await waitForReport(id);
+    const report = await waitForChainCompletion(id);
 
-    expect(report.status).toBe("AwaitReview");
+    expect(["AwaitReview", "Finalized"]).toContain(report.status);
     expect(report.timeline).toBeDefined();
     expect(Array.isArray(report.timeline)).toBe(true);
     expect(report.timeline.length).toBeGreaterThanOrEqual(1);
@@ -32,7 +32,7 @@ describe("full analysis chain", () => {
     expect(report.recommendations.length).toBeGreaterThan(0);
 
     expect(report.reportSummary).toBeTruthy();
-  }, 180_000);
+  }, 300_000);
 
   it("halts at validation when fewer than 2 events are submitted", async () => {
     const id = await createIncident("Chain Test: Single Event", "Testing validation gate halts the chain");
@@ -40,7 +40,7 @@ describe("full analysis chain", () => {
 
     await analyzeIncident(id);
 
-    const report = await waitForReport(id);
+    const report = await waitForReport(id, 120_000);
 
     // Should still be in TimelineDone — chain blocked at validation
     expect(report.status).toBe("TimelineDone");

@@ -1,5 +1,6 @@
 export function baseUrl(): string {
-  return process.env.BASE_URL ?? "http://localhost:8787";
+  const url = process.env.BASE_URL ?? "http://localhost:8787";
+  return url.replace(/\/+$/, "");
 }
 
 export function authToken(): string | undefined {
@@ -57,12 +58,26 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-export async function waitForReport(incidentId: string, maxWaitMs = 120_000, pollMs = 3000): Promise<any> {
+export async function waitForReport(incidentId: string, maxWaitMs = 180_000, pollMs = 5000): Promise<any> {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
     const report = await getReport(incidentId);
-    if (report.status !== "Ingested") return report;
+    if (["AwaitReview", "Finalized", "TimelineDone", "RootCauseDone", "PreventionDone"].includes(report.status)) {
+      return report;
+    }
     await sleep(pollMs);
   }
-  throw new Error("Timed out waiting for report to be ready");
+  const final = await getReport(incidentId);
+  throw new Error(`Timed out waiting for terminal state. Last status: ${final.status}`);
+}
+
+export async function waitForChainCompletion(incidentId: string, maxWaitMs = 300_000, pollMs = 5000): Promise<any> {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const report = await getReport(incidentId);
+    if (report.status === "AwaitReview" || report.status === "Finalized") return report;
+    await sleep(pollMs);
+  }
+  const final = await getReport(incidentId);
+  throw new Error(`Timed out waiting for chain completion. Status: ${final.status}, rootCause: ${JSON.stringify(final.rootCause)}`);
 }

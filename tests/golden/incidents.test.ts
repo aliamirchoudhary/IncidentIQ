@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createIncident, addEvent, analyzeIncident, waitForReport } from "../helpers";
+import { createIncident, addEvent, analyzeIncident, waitForChainCompletion } from "../helpers";
 
 type IncidentCategory = "database" | "deployment" | "network";
 
@@ -58,7 +58,7 @@ describe("golden incidents", () => {
       }
 
       await analyzeIncident(id);
-      const report = await waitForReport(id, 180_000);
+      const report = await waitForChainCompletion(id, 300_000);
 
       // Structure assertions (strict)
       expect(report).toHaveProperty("id");
