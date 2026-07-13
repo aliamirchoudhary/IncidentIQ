@@ -96,5 +96,3 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Full integration tests against production
         run: pnpm --filter tests run test:production
-        env:
-          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
