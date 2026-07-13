@@ -36,8 +36,8 @@ describe("chain recovery — fix and re-trigger", () => {
     const report2 = await waitForChainCompletion(id, 300_000);
 
     expect(["AwaitReview", "Finalized"]).toContain(report2.status);
-    expect(report2.rootCause).toBeDefined();
-    expect(report2.rootCause.cause).toBeTruthy();
+    expect(report2.rootCause).not.toBeNull();
+    expect(report2.rootCause!.cause).toBeTruthy();
     expect(report2.recommendations.length).toBeGreaterThan(0);
   }, 300_000);
 });
