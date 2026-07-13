@@ -4,6 +4,10 @@ import "./App.css";
 
 type Page = "submit" | "timeline" | "review" | "report" | "similar";
 
+function Loader() {
+  return <span className="loader" />;
+}
+
 export default function App() {
   const [page, setPage] = useState<Page>("submit");
   const [carryId, setCarryId] = useState("");
@@ -106,7 +110,7 @@ function LoginForm(props: { onToken: (t: string) => void; onError: (e: unknown) 
           <h4>Generate Token</h4>
           <label>User ID<input value={userId} onChange={(e) => setUserId(e.target.value)} /></label>
           <label>Bootstrap Key<input type="password" value={bootstrapKey} onChange={(e) => setBootstrapKey(e.target.value)} placeholder="From admin" /></label>
-          <button disabled={loading} onClick={handleGenerate}>{loading ? "..." : "Generate"}</button>
+          <button disabled={loading} onClick={handleGenerate}>{loading ? <><Loader /> Generating</> : "Generate"}</button>
         </div>
         <div className="login-divider"><span>or</span></div>
         <div className="login-section">
@@ -120,18 +124,21 @@ function LoginForm(props: { onToken: (t: string) => void; onError: (e: unknown) 
 }
 
 function SubmitPage(props: { onIncidentCreated: (id: string) => void; onError: (e: unknown) => void; setLoading: (v: boolean) => void }) {
+  const [submitting, setSubmitting] = useState(false);
   const [title, setTitle] = useState("");
   const [summary, setSummary] = useState("");
   const [result, setResult] = useState<api.Incident | null>(null);
 
   const handleSubmit = async () => {
     if (!title.trim() || !summary.trim()) { props.onError(new Error("Title and summary are required")); return; }
+    setSubmitting(true);
     props.setLoading(true);
     try {
       const inc = await api.createIncident(title.trim(), summary.trim());
       setResult(inc);
       props.onIncidentCreated(inc.id);
     } catch (e) { props.onError(e); }
+    setSubmitting(false);
     props.setLoading(false);
   };
 
@@ -141,7 +148,7 @@ function SubmitPage(props: { onIncidentCreated: (id: string) => void; onError: (
       <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }}>
         <label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Brief title" /></label>
         <label>Summary<textarea value={summary} onChange={(e) => setSummary(e.target.value)} placeholder="Describe the incident" rows={4} /></label>
-        <button type="submit">Create Incident</button>
+        <button type="submit" disabled={submitting}>{submitting ? <><Loader /> Submitting</> : "Create Incident"}</button>
       </form>
       {result && (
         <div className="card">
@@ -432,7 +439,7 @@ function SimilarPage(props: { onError: (e: unknown) => void; setLoading: (v: boo
         <input type="number" value={k} onChange={(e) => setK(Math.max(1, Math.min(20, Number(e.target.value))))} min={1} max={20} style={{ width: 60 }} />
         <button onClick={search}>Search</button>
       </div>
-      {results && results.length === 0 && <p>No results found.</p>}
+      {results && results.length === 0 && <div className="card" style={{ textAlign: "center", color: "var(--text-muted)", padding: "2rem" }}>No matching incidents found. Try broadening your search.</div>}
       {results && results.length > 0 && (
         <div className="results-list">
           {results.map((r, i) => (
