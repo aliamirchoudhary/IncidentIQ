@@ -28,6 +28,7 @@ interface Recommendation {
 
 export interface ModeratorInput {
   incident_id: string;
+  request_id: string;
   timeline: TimelineEntry[];
   root_cause: RootCauseData;
   recommendations: Recommendation[];
@@ -45,6 +46,22 @@ export interface ModeratorOutput {
   status: "success" | "failure";
   report?: DraftReport;
   error?: string;
+  provider_used?: string;
+  route_used?: string;
+}
+
+function logJson(incidentId: string, requestId: string, agentName: string, version: number, event: string, status: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    incident_id: incidentId,
+    request_id: requestId,
+    agent_name: agentName,
+    version,
+    event,
+    status,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
 }
 
 const MODERATOR_TEMPERATURE = 0.4;
@@ -104,12 +121,16 @@ export class ModeratorAgent extends Agent<Env> {
   }
 
   async generateReport(input: ModeratorInput): Promise<ModeratorOutput> {
+    const startTime = performance.now();
+    logJson(input.incident_id, input.request_id, "ModeratorAgent", 0, "started", "pending", "Report generation started");
+
     if (!input.timeline || input.timeline.length === 0) {
+      logJson(input.incident_id, input.request_id, "ModeratorAgent", 0, "completed", "failure", "Timeline is empty", { latency_ms: 0 });
       return { status: "failure", error: "Timeline is empty" };
     }
 
     try {
-      const summary = await this.tryLLMSummary(input);
+      const { summary, provider, route } = await this.tryLLMSummary(input);
 
       const report: DraftReport = {
         summary,
@@ -119,8 +140,16 @@ export class ModeratorAgent extends Agent<Env> {
         needs_review: input.root_cause.needs_review,
       };
 
-      return { status: "success", report };
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "ModeratorAgent", 0, "completed", "success",
+        `Draft report assembled`,
+        { latency_ms: Math.round(latency), provider, route });
+      return { status: "success", report, provider_used: provider, route_used: route };
     } catch (err) {
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "ModeratorAgent", 0, "completed", "failure",
+        err instanceof Error ? err.message : String(err),
+        { latency_ms: Math.round(latency) });
       return {
         status: "failure",
         error: err instanceof Error ? err.message : String(err),
@@ -128,7 +157,7 @@ export class ModeratorAgent extends Agent<Env> {
     }
   }
 
-  private async tryLLMSummary(input: ModeratorInput): Promise<string> {
+  private async tryLLMSummary(input: ModeratorInput): Promise<{ summary: string; provider?: string; route?: string }> {
     const response = await callLLM({
       systemPrompt: MODERATOR_SYSTEM_PROMPT,
       userPrompt: buildUserPrompt(input),
@@ -142,19 +171,19 @@ export class ModeratorAgent extends Agent<Env> {
     });
 
     if (!("text" in response)) {
-      return templateSummary(input);
+      return { summary: templateSummary(input) };
     }
 
     try {
       const cleaned = extractJson(response.text);
       const parsed = JSON.parse(cleaned);
       if (typeof parsed.summary === "string" && parsed.summary.trim().length > 0) {
-        return parsed.summary;
+        return { summary: parsed.summary, provider: response.provider, route: response.route };
       }
     } catch {
     }
 
-    return templateSummary(input);
+    return { summary: templateSummary(input) };
   }
 }
 

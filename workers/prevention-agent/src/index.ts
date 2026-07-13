@@ -16,9 +16,24 @@ interface RetrievedChunk {
 
 export interface PreventionInput {
   incident_id: string;
+  request_id: string;
   root_cause: string;
   root_cause_evidence: string;
   retrieved_context: RetrievedChunk[];
+}
+
+function logJson(incidentId: string, requestId: string, agentName: string, version: number, event: string, status: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    incident_id: incidentId,
+    request_id: requestId,
+    agent_name: agentName,
+    version,
+    event,
+    status,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
 }
 
 interface Recommendation {
@@ -77,20 +92,38 @@ export class PreventionAgent extends Agent<Env> {
   }
 
   async generatePrevention(input: PreventionInput): Promise<PreventionOutput> {
+    const startTime = performance.now();
+    logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "started", "pending", "Prevention generation started");
+
     if (!input.root_cause) {
+      logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "completed", "failure", "Root cause is empty", { latency_ms: 0 });
       return { status: "failure", error: "Root cause is empty" };
     }
 
     try {
       const llmResult = await this.tryLLMPrevention(input);
-      if (llmResult) return llmResult;
+      if (llmResult) {
+        const latency = performance.now() - startTime;
+        logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "completed", "success",
+          `${llmResult.recommendations!.length} recommendations generated via ${llmResult.provider_used}`,
+          { latency_ms: Math.round(latency), provider: llmResult.provider_used, route: llmResult.route_used });
+        return llmResult;
+      }
 
       const fallback = deterministicPrevention();
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "completed", "success",
+        `${fallback.length} recommendations (deterministic fallback)`,
+        { latency_ms: Math.round(latency) });
       return {
         status: "success",
         recommendations: fallback,
       };
     } catch (err) {
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "completed", "failure",
+        err instanceof Error ? err.message : String(err),
+        { latency_ms: Math.round(latency) });
       return {
         status: "failure",
         error: err instanceof Error ? err.message : String(err),

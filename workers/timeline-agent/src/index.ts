@@ -15,7 +15,22 @@ interface TimelineEventInput {
 
 export interface TimelineInput {
   incident_id: string;
+  request_id: string;
   raw_events: TimelineEventInput[];
+}
+
+function logJson(incidentId: string, requestId: string, agentName: string, version: number, event: string, status: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    incident_id: incidentId,
+    request_id: requestId,
+    agent_name: agentName,
+    version,
+    event,
+    status,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
 }
 
 interface TimelineEntry {
@@ -77,17 +92,33 @@ export class TimelineAgent extends Agent<Env> {
   }
 
   async generateTimeline(input: TimelineInput): Promise<TimelineOutput> {
+    const startTime = performance.now();
+    logJson(input.incident_id, input.request_id, "TimelineAgent", 0, "started", "pending", "Timeline generation started");
+
     try {
       const llmResult = await this.tryLLMTimeline(input.raw_events);
       if (llmResult) {
+        const latency = performance.now() - startTime;
+        logJson(input.incident_id, input.request_id, "TimelineAgent", 0, "completed", "success",
+          `Timeline generated with ${llmResult.timeline!.length} entries via ${llmResult.provider_used}`,
+          { latency_ms: Math.round(latency), provider: llmResult.provider_used, route: llmResult.route_used });
         return llmResult;
       }
+
       const fallback = this.deterministicTimeline(input.raw_events);
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "TimelineAgent", 0, "completed", "success",
+        `Timeline generated with ${fallback.length} entries (deterministic fallback)`,
+        { latency_ms: Math.round(latency) });
       return {
         status: "success",
         timeline: fallback,
       };
     } catch (err) {
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "TimelineAgent", 0, "completed", "failure",
+        err instanceof Error ? err.message : String(err),
+        { latency_ms: Math.round(latency) });
       return {
         status: "failure",
         error: err instanceof Error ? err.message : String(err),

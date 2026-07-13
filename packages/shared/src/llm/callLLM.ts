@@ -87,11 +87,24 @@ async function callProvider(
   return { text, raw: json };
 }
 
+function logLLMEvent(event: string, provider: string, route: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    agent_name: "callLLM",
+    event,
+    provider,
+    route,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
+}
+
 async function tryGateway(
   systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
   env: { CLOUDFLARE_API_TOKEN?: string },
 ): Promise<CallLLMResult | null> {
   if (!env.CLOUDFLARE_API_TOKEN) return null;
+  const t0 = performance.now();
   try {
     const result = await callProvider(
       AI_GATEWAY_BASE,
@@ -99,8 +112,10 @@ async function tryGateway(
       GATEWAY_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
+    logLLMEvent("completed", "gemini", "gateway", "Gateway call succeeded", { latency_ms: Math.round(performance.now() - t0) });
     return { text: result.text, provider: "gemini", route: "gateway", model: GATEWAY_MODEL };
-  } catch {
+  } catch (err) {
+    logLLMEvent("completed", "gemini", "gateway", "Gateway call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
     return null;
   }
 }
@@ -109,6 +124,7 @@ async function tryDirectGemini(
   systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
   env: { GEMINI_API_KEY: string },
 ): Promise<CallLLMResult | null> {
+  const t0 = performance.now();
   try {
     const result = await callProvider(
       DIRECT_GEMINI_BASE,
@@ -116,8 +132,10 @@ async function tryDirectGemini(
       DIRECT_GEMINI_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
+    logLLMEvent("completed", "gemini", "direct", "Direct Gemini call succeeded", { latency_ms: Math.round(performance.now() - t0) });
     return { text: result.text, provider: "gemini", route: "direct", model: DIRECT_GEMINI_MODEL };
-  } catch {
+  } catch (err) {
+    logLLMEvent("completed", "gemini", "direct", "Direct Gemini call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
     return null;
   }
 }
@@ -126,6 +144,7 @@ async function tryOpenRouter(
   systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
   env: { OPENROUTER_API_KEY?: string },
 ): Promise<CallLLMResult | null> {
+  const t0 = performance.now();
   try {
     const result = await callProvider(
       OPENROUTER_API_BASE,
@@ -133,8 +152,10 @@ async function tryOpenRouter(
       OPENROUTER_MODEL,
       systemPrompt, userPrompt, maxTokens, temperature,
     );
+    logLLMEvent("completed", "openrouter", "direct", "OpenRouter call succeeded", { latency_ms: Math.round(performance.now() - t0) });
     return { text: result.text, provider: "openrouter", route: "direct", model: OPENROUTER_MODEL };
-  } catch {
+  } catch (err) {
+    logLLMEvent("completed", "openrouter", "direct", "OpenRouter call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
     return null;
   }
 }

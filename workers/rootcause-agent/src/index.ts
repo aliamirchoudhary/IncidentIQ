@@ -23,9 +23,24 @@ interface TimelineEntry {
 
 export interface RootCauseInput {
   incident_id: string;
+  request_id: string;
   timeline: TimelineEntry[];
   retrieved_context: RetrievedChunk[];
   confidence_threshold_override?: number;
+}
+
+function logJson(incidentId: string, requestId: string, agentName: string, version: number, event: string, status: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    incident_id: incidentId,
+    request_id: requestId,
+    agent_name: agentName,
+    version,
+    event,
+    status,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
 }
 
 interface ToolInvocation {
@@ -94,7 +109,11 @@ export class RootCauseAgent extends Agent<Env> {
   }
 
   async analyzeRootCause(input: RootCauseInput): Promise<RootCauseOutput> {
+    const startTime = performance.now();
+    logJson(input.incident_id, input.request_id, "RootCauseAgent", 0, "started", "pending", "Root cause analysis started");
+
     if (!input.timeline || input.timeline.length === 0) {
+      logJson(input.incident_id, input.request_id, "RootCauseAgent", 0, "completed", "failure", "Timeline is empty", { latency_ms: 0 });
       return { status: "failure", error: "Timeline is empty" };
     }
 
@@ -102,9 +121,19 @@ export class RootCauseAgent extends Agent<Env> {
 
     try {
       const llmResult = await this.tryLLMRootCause(input);
-      if (llmResult) return llmResult;
+      if (llmResult) {
+        const latency = performance.now() - startTime;
+        logJson(input.incident_id, input.request_id, "RootCauseAgent", 0, "completed", "success",
+          `Root cause: ${llmResult.cause} (confidence: ${llmResult.confidence})`,
+          { latency_ms: Math.round(latency), provider: llmResult.provider_used, route: llmResult.route_used });
+        return llmResult;
+      }
 
       const fallback = deterministicRootCause(input);
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "RootCauseAgent", 0, "completed", "success",
+        `Deterministic fallback: ${fallback.cause} (confidence: ${fallback.confidence})`,
+        { latency_ms: Math.round(latency) });
       return {
         status: "success",
         cause: fallback.cause,
@@ -114,6 +143,10 @@ export class RootCauseAgent extends Agent<Env> {
         needs_review: fallback.confidence < threshold,
       };
     } catch (err) {
+      const latency = performance.now() - startTime;
+      logJson(input.incident_id, input.request_id, "RootCauseAgent", 0, "completed", "failure",
+        err instanceof Error ? err.message : String(err),
+        { latency_ms: Math.round(latency) });
       return {
         status: "failure",
         error: err instanceof Error ? err.message : String(err),

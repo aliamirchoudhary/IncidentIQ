@@ -18,6 +18,7 @@ interface TimelineEventInput {
 
 interface TimelineInput {
   incident_id: string;
+  request_id: string;
   raw_events: TimelineEventInput[];
 }
 
@@ -28,6 +29,7 @@ interface TimelineAgentRPC extends AgentRPC {
 
 interface RootCauseInput {
   incident_id: string;
+  request_id: string;
   timeline: Array<{ time: string; event: string; confidence: number; note?: string }>;
   retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }>;
   confidence_threshold_override?: number;
@@ -51,6 +53,7 @@ interface RootCauseAgentRPC extends AgentRPC {
 
 interface PreventionInput {
   incident_id: string;
+  request_id: string;
   root_cause: string;
   root_cause_evidence: string;
   retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }>;
@@ -70,6 +73,7 @@ interface PreventionAgentRPC extends AgentRPC {
 
 interface ModeratorInput {
   incident_id: string;
+  request_id: string;
   timeline: Array<{ time: string; event: string; confidence: number; note?: string }>;
   root_cause: { cause: string; confidence: number; evidence: string; needs_review: boolean };
   recommendations: Array<{ recommendation: string; reference: string | null }>;
@@ -85,6 +89,8 @@ interface ModeratorOutput {
     needs_review: boolean;
   };
   error?: string;
+  provider_used?: string;
+  route_used?: string;
 }
 
 interface ModeratorAgentRPC extends AgentRPC {
@@ -126,6 +132,20 @@ function json(data: unknown, status = 200): Response {
 
 function jsonError(code: string, message: string, status = 400): Response {
   return json({ error: { code, message } }, status);
+}
+
+function logJson(incidentId: string, requestId: string, agentName: string, version: number, event: string, status: string, detail: string, extra?: Record<string, unknown>): void {
+  console.log(JSON.stringify({
+    incident_id: incidentId,
+    request_id: requestId,
+    agent_name: agentName,
+    version,
+    event,
+    status,
+    detail,
+    timestamp: new Date().toISOString(),
+    ...extra,
+  }));
 }
 
 function getAllowedOrigins(env: Env): string[] {
@@ -481,6 +501,7 @@ export default class extends WorkerEntrypoint<Env> {
 
   private async handleAnalyze(incidentId: string): Promise<Response> {
     try {
+      const requestId = crypto.randomUUID();
       const room = getRoom(this.env, incidentId);
 
       const incident = await this.env.incidentiq_db.prepare(
@@ -495,7 +516,7 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\" or \"TimelineDone\"", 409);
       }
 
-      this.ctx.waitUntil(this.runFullChain(incidentId));
+      this.ctx.waitUntil(this.runFullChain(incidentId, requestId));
 
       return json({
         data: {
@@ -509,7 +530,7 @@ export default class extends WorkerEntrypoint<Env> {
     }
   }
 
-  private async runFullChain(incidentId: string): Promise<void> {
+  private async runFullChain(incidentId: string, requestId: string): Promise<void> {
     try {
       const room = getRoom(this.env, incidentId);
       const state: any = await room.getState();
@@ -526,12 +547,17 @@ export default class extends WorkerEntrypoint<Env> {
       }));
 
       // ---- STEP 1: Timeline Agent ----
+      const t0 = performance.now();
+      logJson(incidentId, requestId, "CoreApi", state.version, "started", "pending", "Calling TimelineAgent");
       const timelineStub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
-      const timelineResult: any = await timelineStub.generateTimeline({ incident_id: incidentId, raw_events: rawEvents });
+      const timelineResult: any = await timelineStub.generateTimeline({ incident_id: incidentId, request_id: requestId, raw_events: rawEvents });
+      const t1 = performance.now();
 
       if (timelineResult.status !== "success" || !timelineResult.timeline) {
+        const latency = Math.round(t1 - t0);
+        logJson(incidentId, requestId, "CoreApi", state.version, "completed", "failure", "TimelineAgent failed: " + (timelineResult.error ?? "Unknown error"), { latency_ms: latency });
         await logActivity(
-          this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "TimelineAgent", requestId,
           state.version, "completed", "failure", timelineResult.error ?? "Unknown error",
         );
         return;
@@ -558,13 +584,19 @@ export default class extends WorkerEntrypoint<Env> {
         if (tResult.success) currentVersion = tResult.version;
       }
 
+      const timelineLatency = Math.round(t1 - t0);
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "success",
+        "TimelineAgent completed with " + timelineResult.timeline.length + " entries",
+        { latency_ms: timelineLatency, agent_latency_ms: timelineLatency, provider: timelineResult.provider_used ?? null });
       await logActivity(
-        this.env.incidentiq_db, incidentId, "TimelineAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "TimelineAgent", requestId,
         currentVersion, "completed", "success",
         "Timeline generated with " + timelineResult.timeline.length + " entries",
       );
 
       // ---- STEP 2: Validation Gate ----
+      const v0 = performance.now();
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Running ValidationGate");
       const validation = validateTimeline(timelineResult.timeline, rawEvents);
 
       if (!validation.valid) {
@@ -573,8 +605,11 @@ export default class extends WorkerEntrypoint<Env> {
         await this.env.incidentiq_db.prepare(
           "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         ).bind(crypto.randomUUID(), incidentId, "agent", issuesSummary, "validation", now).run();
+        logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "invalid",
+          "Validation failed: " + validation.issues.map((i: any) => i.type + ": " + i.detail).join("; "),
+          { latency_ms: Math.round(performance.now() - v0) });
         await logActivity(
-          this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "ValidationGate", requestId,
           currentVersion, "completed", "invalid",
           "Validation failed: " + validation.issues.map((i: any) => i.type + ": " + i.detail).join("; "),
         );
@@ -586,8 +621,11 @@ export default class extends WorkerEntrypoint<Env> {
       currentVersion = validatedTransition.version;
       await (room as any).setValidationStatus(null);
 
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "valid",
+        "Validation passed: " + timelineResult.timeline.length + " timeline entries checked",
+        { latency_ms: Math.round(performance.now() - v0) });
       await logActivity(
-        this.env.incidentiq_db, incidentId, "ValidationGate", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "ValidationGate", requestId,
         currentVersion, "completed", "valid",
         "Validation passed: " + timelineResult.timeline.length + " timeline entries checked",
       );
@@ -611,21 +649,29 @@ export default class extends WorkerEntrypoint<Env> {
           score: c.score,
         }));
       } catch (err) {
+        logJson(incidentId, requestId, "KnowledgeRetrieval", currentVersion, "completed", "degraded",
+          "Knowledge retrieval failed: " + (err instanceof Error ? err.message : String(err)));
         await logActivity(
-          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", requestId,
           currentVersion, "completed", "degraded",
           "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
         );
       }
 
+      const rc0 = performance.now();
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling RootCauseAgent");
       const rcStub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
       const rcResult: RootCauseOutput = await rcStub.analyzeRootCause({
-        incident_id: incidentId, timeline, retrieved_context,
+        incident_id: incidentId, request_id: requestId, timeline, retrieved_context,
       });
+      const rc1 = performance.now();
 
       if (rcResult.status !== "success" || !rcResult.cause) {
+        logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "failure",
+          "RootCauseAgent failed: " + (rcResult.error ?? "Unknown error"),
+          { latency_ms: Math.round(rc1 - rc0) });
         await logActivity(
-          this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "RootCauseAgent", requestId,
           currentVersion, "completed", "failure", rcResult.error ?? "RootCauseAgent failed",
         );
         return;
@@ -650,8 +696,12 @@ export default class extends WorkerEntrypoint<Env> {
       if (!rcTransition.success) return;
       currentVersion = rcTransition.version;
 
+      const rcLatency = Math.round(rc1 - rc0);
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "success",
+        "RootCauseAgent completed: " + rcResult.cause,
+        { latency_ms: rcLatency, agent_latency_ms: rcLatency, provider: rcResult.provider_used ?? null });
       await logActivity(
-        this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "RootCauseAgent", requestId,
         currentVersion, "completed", "success",
         "Root cause: " + rcResult.cause,
       );
@@ -672,24 +722,33 @@ export default class extends WorkerEntrypoint<Env> {
           score: c.score,
         }));
       } catch (err) {
+        logJson(incidentId, requestId, "KnowledgeRetrieval", currentVersion, "completed", "degraded",
+          "Prevention knowledge retrieval degraded: " + (err instanceof Error ? err.message : String(err)));
         await logActivity(
-          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", requestId,
           currentVersion, "completed", "degraded",
           "Prevention knowledge retrieval degraded: " + (err instanceof Error ? err.message : String(err)),
         );
       }
 
+      const p0 = performance.now();
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling PreventionAgent");
       const prevStub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
       const prevResult: PreventionOutput = await prevStub.generatePrevention({
         incident_id: incidentId,
+        request_id: requestId,
         root_cause: rootCauseRow.cause,
         root_cause_evidence: rootCauseRow.evidence ?? "",
         retrieved_context: preventionContext,
       });
+      const p1 = performance.now();
 
       if (prevResult.status !== "success" || !prevResult.recommendations) {
+        logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "failure",
+          "PreventionAgent failed: " + (prevResult.error ?? "Unknown error"),
+          { latency_ms: Math.round(p1 - p0) });
         await logActivity(
-          this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "PreventionAgent", requestId,
           currentVersion, "completed", "failure", prevResult.error ?? "PreventionAgent failed",
         );
         return;
@@ -711,8 +770,12 @@ export default class extends WorkerEntrypoint<Env> {
       if (!prevTransition.success) return;
       currentVersion = prevTransition.version;
 
+      const prevLatency = Math.round(p1 - p0);
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "success",
+        "PreventionAgent completed with " + prevResult.recommendations.length + " recommendations",
+        { latency_ms: prevLatency, agent_latency_ms: prevLatency, provider: prevResult.provider_used ?? null });
       await logActivity(
-        this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "PreventionAgent", requestId,
         currentVersion, "completed", "success",
         prevResult.recommendations.length + " recommendations generated",
       );
@@ -732,9 +795,12 @@ export default class extends WorkerEntrypoint<Env> {
         reference: r.reference ?? null,
       }));
 
+      const m0 = performance.now();
+      logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling ModeratorAgent");
       const modStub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
       const modResult: ModeratorOutput = await modStub.generateReport({
         incident_id: incidentId,
+        request_id: requestId,
         timeline,
         root_cause: {
           cause: rcFull.cause,
@@ -744,10 +810,14 @@ export default class extends WorkerEntrypoint<Env> {
         },
         recommendations,
       });
+      const m1 = performance.now();
 
       if (modResult.status !== "success" || !modResult.report) {
+        logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "failure",
+          "ModeratorAgent failed: " + (modResult.error ?? "Unknown error"),
+          { latency_ms: Math.round(m1 - m0) });
         await logActivity(
-          this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "ModeratorAgent", requestId,
           currentVersion, "completed", "failure", modResult.error ?? "ModeratorAgent failed",
         );
         return;
@@ -758,14 +828,20 @@ export default class extends WorkerEntrypoint<Env> {
       const modTransition: any = await room.transition("AwaitReview" as IncidentState);
       if (!modTransition.success) return;
 
+      const modLatency = Math.round(m1 - m0);
+      logJson(incidentId, requestId, "CoreApi", modTransition.version, "completed", "success",
+        "Full analysis chain complete",
+        { latency_ms: modLatency, agent_latency_ms: modLatency, provider: modResult.provider_used ?? null });
       await logActivity(
-        this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "ModeratorAgent", requestId,
         modTransition.version, "completed", "success",
         "Draft report assembled and ready for review",
       );
     } catch (err) {
+      logJson(incidentId, requestId, "AutoChain", 0, "completed", "failure",
+        "Full chain failed: " + (err instanceof Error ? err.message : String(err)));
       await logActivity(
-        this.env.incidentiq_db, incidentId, "AutoChain", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "AutoChain", requestId,
         0, "completed", "failure",
         "Full chain failed: " + (err instanceof Error ? err.message : String(err)),
       ).catch(() => {});
@@ -774,6 +850,7 @@ export default class extends WorkerEntrypoint<Env> {
 
   private async handleRootCause(incidentId: string, body?: any): Promise<Response> {
     try {
+      const requestId = crypto.randomUUID();
       const room = getRoom(this.env, incidentId);
       const incident = await this.env.incidentiq_db.prepare(
         "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
@@ -814,7 +891,7 @@ export default class extends WorkerEntrypoint<Env> {
         }));
       } catch (err) {
         await logActivity(
-          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", requestId,
           state.version, "completed", "degraded",
           "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
         );
@@ -838,6 +915,7 @@ export default class extends WorkerEntrypoint<Env> {
       const stub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
       const result: RootCauseOutput = await stub.analyzeRootCause({
         incident_id: incidentId,
+        request_id: requestId,
         timeline,
         retrieved_context,
         ...(confidenceThresholdOverride !== undefined ? { confidence_threshold_override: confidenceThresholdOverride } : {}),
@@ -845,7 +923,7 @@ export default class extends WorkerEntrypoint<Env> {
 
       if (result.status !== "success" || !result.cause) {
         await logActivity(
-          this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "RootCauseAgent", requestId,
           state.version, "completed", "failure", result.error ?? "RootCauseAgent failed",
         );
         return jsonError("AGENT_ERROR", result.error ?? "RootCauseAgent failed to generate root cause", 500);
@@ -867,7 +945,7 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       await logActivity(
-        this.env.incidentiq_db, incidentId, "RootCauseAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "RootCauseAgent", requestId,
         transitionResult.version, "completed", "success",
         "Root cause: " + result.cause,
       );
@@ -895,6 +973,7 @@ export default class extends WorkerEntrypoint<Env> {
 
   private async handlePrevention(incidentId: string): Promise<Response> {
     try {
+      const requestId = crypto.randomUUID();
       const room = getRoom(this.env, incidentId);
       const incident = await this.env.incidentiq_db.prepare(
         "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
@@ -923,7 +1002,7 @@ export default class extends WorkerEntrypoint<Env> {
         }));
       } catch (err) {
         await logActivity(
-          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "KnowledgeRetrieval", requestId,
           state.version, "completed", "degraded",
           "Knowledge retrieval failed, proceeding with empty context: " + (err instanceof Error ? err.message : String(err)),
         );
@@ -932,6 +1011,7 @@ export default class extends WorkerEntrypoint<Env> {
       const stub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
       const result: PreventionOutput = await stub.generatePrevention({
         incident_id: incidentId,
+        request_id: requestId,
         root_cause: rootCauseRow.cause,
         root_cause_evidence: rootCauseRow.evidence ?? "",
         retrieved_context,
@@ -939,7 +1019,7 @@ export default class extends WorkerEntrypoint<Env> {
 
       if (result.status !== "success" || !result.recommendations || result.recommendations.length === 0) {
         await logActivity(
-          this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "PreventionAgent", requestId,
           state.version, "completed", "failure", result.error ?? "PreventionAgent failed",
         );
         return jsonError("AGENT_ERROR", result.error ?? "PreventionAgent failed to generate recommendations", 500);
@@ -958,7 +1038,7 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       await logActivity(
-        this.env.incidentiq_db, incidentId, "PreventionAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "PreventionAgent", requestId,
         transitionResult.version, "completed", "success",
         "Generated " + result.recommendations.length + " recommendations",
       );
@@ -982,6 +1062,7 @@ export default class extends WorkerEntrypoint<Env> {
 
   private async handleModerate(incidentId: string): Promise<Response> {
     try {
+      const requestId = crypto.randomUUID();
       const room = getRoom(this.env, incidentId);
       const incident = await this.env.incidentiq_db.prepare(
         "SELECT id FROM incidents WHERE id = ? AND deleted_at IS NULL"
@@ -1030,6 +1111,7 @@ export default class extends WorkerEntrypoint<Env> {
       const stub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
       const result: ModeratorOutput = await stub.generateReport({
         incident_id: incidentId,
+        request_id: requestId,
         timeline,
         root_cause: {
           cause: rootCauseRow.cause,
@@ -1042,7 +1124,7 @@ export default class extends WorkerEntrypoint<Env> {
 
       if (result.status !== "success" || !result.report) {
         await logActivity(
-          this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+          this.env.incidentiq_db, incidentId, "ModeratorAgent", requestId,
           state.version, "completed", "failure", result.error ?? "ModeratorAgent failed",
         );
         return jsonError("AGENT_ERROR", result.error ?? "ModeratorAgent failed to generate report", 500);
@@ -1056,7 +1138,7 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       await logActivity(
-        this.env.incidentiq_db, incidentId, "ModeratorAgent", crypto.randomUUID(),
+        this.env.incidentiq_db, incidentId, "ModeratorAgent", requestId,
         transitionResult.version, "completed", "success",
         "Draft report assembled and ready for review",
       );
