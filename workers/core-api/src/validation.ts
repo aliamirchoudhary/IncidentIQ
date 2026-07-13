@@ -29,7 +29,7 @@ export interface ValidationResult {
   issues: ValidationIssue[];
 }
 
-function areContradictory(detail1: string, detail2: string): boolean {
+export function areContradictory(detail1: string, detail2: string): boolean {
   const d1 = detail1.toLowerCase();
   const d2 = detail2.toLowerCase();
 

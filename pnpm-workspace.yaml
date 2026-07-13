@@ -2,6 +2,7 @@ packages:
   - "workers/*"
   - "packages/*"
   - "client"
+  - "tests"
 allowBuilds:
   core-js-pure: set this to true or false
   esbuild: true
