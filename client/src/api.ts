@@ -1,4 +1,4 @@
-const BASE = import.meta.env.VITE_API_BASE ?? "";
+const BASE = import.meta.env.VITE_API_BASE ?? "https://core-api.aliamirchoudhary.workers.dev";
 
 export function getToken(): string | null {
   try { return localStorage.getItem("incidentiq_token"); } catch { return null; }
