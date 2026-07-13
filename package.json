@@ -8,7 +8,8 @@
     "deploy:core": "pnpm --filter core-api run deploy",
     "deploy": "pnpm run deploy:agents && pnpm run deploy:core"
   },
+  "packageManager": "pnpm@11.11.0",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   }
 }
