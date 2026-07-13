@@ -48,5 +48,8 @@
       "database_name": "incidentiq-db",
       "database_id": "beefd2de-56bd-49a8-83a9-80f7c45237e0"
     }
-  ]
+  ],
+  "vars": {
+    "ALLOWED_ORIGINS": "http://localhost:5173,http://localhost:8787,http://127.0.0.1:8787,https://incidentiq.pages.dev"
+  }
 }

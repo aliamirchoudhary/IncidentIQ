@@ -99,6 +99,8 @@ interface Env {
   INCIDENT_ROOM: DurableObjectNamespace<IncidentRoom>;
   incidentiq_db: D1Database;
   AI: any;
+  AUTH_BOOTSTRAP_KEY?: string;
+  ALLOWED_ORIGINS?: string;
 }
 
 interface IncidentDataLoose {
@@ -126,18 +128,30 @@ function jsonError(code: string, message: string, status = 400): Response {
   return json({ error: { code, message } }, status);
 }
 
-function corsHeaders(origin: string): Record<string, string> {
+function getAllowedOrigins(env: Env): string[] {
+  const raw = env.ALLOWED_ORIGINS;
+  if (raw) return raw.split(",").map((s) => s.trim()).filter(Boolean);
+  return ["http://localhost:5173", "http://localhost:8787", "http://127.0.0.1:8787"];
+}
+
+function corsHeaders(origin: string, env: Env): Record<string, string> {
+  const allowed = getAllowedOrigins(env);
+  const validOrigin = origin !== "*" && allowed.some((a) => a === origin) ? origin : allowed[0] ?? "http://localhost:5173";
   return {
-    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Origin": validOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
   };
 }
 
-function addCors(response: Response, origin: string): Response {
+function addCors(response: Response, origin: string, env: Env): Response {
   const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", origin);
+  const allowed = getAllowedOrigins(env);
+  const validOrigin = origin !== "*" && allowed.some((a) => a === origin) ? origin : allowed[0] ?? "http://localhost:5173";
+  headers.set("Access-Control-Allow-Origin", validOrigin);
+  headers.set("Vary", "Origin");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -151,8 +165,22 @@ function getOrigin(request: Request): string {
   return "*";
 }
 
-function getAuthUser(_request: Request): { id: string } | null {
-  return null;
+async function getAuthUser(request: Request, db: D1Database): Promise<{ id: string } | null> {
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader) return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1];
+  try {
+    const row = await db.prepare(
+      "SELECT user_id, expires_at FROM sessions WHERE token = ?"
+    ).bind(token).first<{ user_id: string; expires_at: string }>();
+    if (!row) return null;
+    if (new Date(row.expires_at) < new Date()) return null;
+    return { id: row.user_id };
+  } catch {
+    return null;
+  }
 }
 
 function getRoom(env: Env, id: string): DurableObjectStub<IncidentRoom> {
@@ -171,135 +199,148 @@ export default class extends WorkerEntrypoint<Env> {
     const origin = getOrigin(request);
 
     if (method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(origin) });
+      return new Response(null, { status: 204, headers: corsHeaders(origin, this.env) });
     }
 
     const path = url.pathname;
 
+    // AUTH — public (bootstrap)
+    if (method === "POST" && path === "/api/v1/auth/token") {
+      return addCors(await this.handleAuthToken(request), origin, this.env);
+    }
+
+    // Require auth for all remaining endpoints
+    const authUser = await getAuthUser(request, this.env.incidentiq_db);
+    const requireAuth = () => authUser ?? null;
+    const isMutating = method === "POST" || method === "PUT" || method === "DELETE" || method === "PATCH";
+    if (isMutating && !authUser && path.startsWith("/api/v1/") && !path.startsWith("/api/v1/auth/")) {
+      return addCors(jsonError("UNAUTHORIZED", "Authentication required", 401), origin, this.env);
+    }
+
     if (method === "GET" && path === "/api/v1/debug/ping-all") {
-      return addCors(await this.handlePingAll(), origin);
+      return addCors(await this.handlePingAll(), origin, this.env);
     }
 
     if (method === "POST" && path === "/api/v1/debug/do/create") {
-      return addCors(await this.handleDoCreate(), origin);
+      return addCors(await this.handleDoCreate(), origin, this.env);
     }
 
     if (method === "GET" && path === "/api/v1/debug/call-llm") {
-      return addCors(await this.handleDebugCallLLM(url), origin);
+      return addCors(await this.handleDebugCallLLM(url), origin, this.env);
     }
 
     const doMatch = path.match(/^\/api\/v1\/debug\/do\/([^/]+)$/);
     if (doMatch) {
       const id = doMatch[1];
-      if (method === "GET") return addCors(await this.handleDoGet(id), origin);
+      if (method === "GET") return addCors(await this.handleDoGet(id), origin, this.env);
       if (method === "POST") {
         const body = await request.json().catch(() => ({})) as { transition?: string };
-        return addCors(await this.handleDoTransition(id, body.transition), origin);
+        return addCors(await this.handleDoTransition(id, body.transition), origin, this.env);
       }
     }
 
     const concurrencyMatch = path.match(/^\/api\/v1\/debug\/do\/([^/]+)\/concurrency-test$/);
     if (concurrencyMatch && method === "POST") {
-      return addCors(await this.handleConcurrencyTest(concurrencyMatch[1]), origin);
+      return addCors(await this.handleConcurrencyTest(concurrencyMatch[1]), origin, this.env);
     }
 
     // PUBLIC API ROUTES
 
     if (method === "POST" && path === "/api/v1/incidents") {
       const body = await request.json().catch(() => ({})) as { title?: string; summary?: string };
-      const result = await createIncident(this.env as any, this.env.incidentiq_db, body, getAuthUser(request));
-      return addCors(result, origin);
+      const result = await createIncident(this.env as any, this.env.incidentiq_db, body, requireAuth());
+      return addCors(result, origin, this.env);
     }
 
     const eventsMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/events$/);
     if (eventsMatch) {
       const incidentId = eventsMatch[1];
       const body = await request.json().catch(() => ({})) as any;
-      const result = await addEvent(this.env as any, this.env.incidentiq_db, incidentId, body, getAuthUser(request));
-      return addCors(result, origin);
+      const result = await addEvent(this.env as any, this.env.incidentiq_db, incidentId, body, requireAuth());
+      return addCors(result, origin, this.env);
     }
 
     const reportMatch = method === "GET" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/report$/);
     if (reportMatch) {
       const result = await getReport(this.env as any, this.env.incidentiq_db, reportMatch[1]);
-      return addCors(result, origin);
+      return addCors(result, origin, this.env);
     }
 
     const similarMatch = method === "GET" && path === "/api/v1/incidents/similar";
     if (similarMatch) {
-      return addCors(await this.handleSimilar(url), origin);
+      return addCors(await this.handleSimilar(url), origin, this.env);
     }
 
     const incidentMatch = method === "GET" && path.match(/^\/api\/v1\/incidents\/([^/]+)$/);
     if (incidentMatch) {
       const result = await getIncident(this.env as any, this.env.incidentiq_db, incidentMatch[1]);
-      return addCors(result, origin);
+      return addCors(result, origin, this.env);
     }
 
     const analyzeMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze$/);
     if (analyzeMatch) {
-      return addCors(await this.handleAnalyze(analyzeMatch[1]), origin);
+      return addCors(await this.handleAnalyze(analyzeMatch[1]), origin, this.env);
     }
 
     const rootcauseMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-rootcause$/);
     if (rootcauseMatch) {
       const body = await request.json().catch(() => ({})) as any;
-      return addCors(await this.handleRootCause(rootcauseMatch[1], body), origin);
+      return addCors(await this.handleRootCause(rootcauseMatch[1], body), origin, this.env);
     }
 
     const preventionMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-prevention$/);
     if (preventionMatch) {
-      return addCors(await this.handlePrevention(preventionMatch[1]), origin);
+      return addCors(await this.handlePrevention(preventionMatch[1]), origin, this.env);
     }
 
     const moderateMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/analyze-moderate$/);
     if (moderateMatch) {
-      return addCors(await this.handleModerate(moderateMatch[1]), origin);
+      return addCors(await this.handleModerate(moderateMatch[1]), origin, this.env);
     }
 
     const reviewMatch = method === "POST" && path.match(/^\/api\/v1\/incidents\/([^/]+)\/review$/);
     if (reviewMatch) {
       const body = await request.json().catch(() => ({})) as any;
-      return addCors(await this.handleReview(reviewMatch[1], body), origin);
+      return addCors(await this.handleReview(reviewMatch[1], body), origin, this.env);
     }
 
     const userGetPrefs = method === "GET" && path.match(/^\/api\/v1\/users\/([^/]+)\/preferences$/);
     if (userGetPrefs) {
-      return addCors(await this.handleGetPreferences(userGetPrefs[1]), origin);
+      return addCors(await this.handleGetPreferences(userGetPrefs[1]), origin, this.env);
     }
 
     const userPutPrefs = method === "PUT" && path.match(/^\/api\/v1\/users\/([^/]+)\/preferences$/);
     if (userPutPrefs) {
       const body = await request.json().catch(() => ({})) as any;
-      return addCors(await this.handlePutPreferences(userPutPrefs[1], body), origin);
+      return addCors(await this.handlePutPreferences(userPutPrefs[1], body), origin, this.env);
     }
 
     // KNOWLEDGE / RAG ROUTES
 
     if (method === "POST" && path === "/api/v1/knowledge/seed") {
-      return addCors(await this.handleKnowledgeSeed(), origin);
+      return addCors(await this.handleKnowledgeSeed(), origin, this.env);
     }
 
     if (method === "POST" && path === "/api/v1/knowledge/ingest") {
       const body = await request.json().catch(() => ({})) as any;
-      return addCors(await this.handleKnowledgeIngest(body), origin);
+      return addCors(await this.handleKnowledgeIngest(body), origin, this.env);
     }
 
     if (method === "GET" && path === "/api/v1/knowledge/query") {
-      return addCors(await this.handleKnowledgeQuery(url), origin);
+      return addCors(await this.handleKnowledgeQuery(url), origin, this.env);
     }
 
     const deleteMatch = method === "DELETE" && path.match(/^\/api\/v1\/knowledge\/sources\/([^/]+)$/);
     if (deleteMatch) {
-      return addCors(await this.handleKnowledgeDelete(deleteMatch[1]), origin);
+      return addCors(await this.handleKnowledgeDelete(deleteMatch[1]), origin, this.env);
     }
 
     const restoreMatch = method === "PATCH" && path.match(/^\/api\/v1\/knowledge\/sources\/([^/]+)\/restore$/);
     if (restoreMatch) {
-      return addCors(await this.handleKnowledgeRestore(restoreMatch[1]), origin);
+      return addCors(await this.handleKnowledgeRestore(restoreMatch[1]), origin, this.env);
     }
 
-    return addCors(jsonError("NOT_FOUND", "Not found", 404), origin);
+    return addCors(jsonError("NOT_FOUND", "Not found", 404), origin, this.env);
   }
 
   private agentStubs(): Array<[string, DurableObjectStub]> {
@@ -309,6 +350,36 @@ export default class extends WorkerEntrypoint<Env> {
       ["prevention-agent", getAgentStub(this.env.PREVENTION_AGENT)],
       ["moderator-agent", getAgentStub(this.env.MODERATOR_AGENT)],
     ];
+  }
+
+  private async handleAuthToken(request: Request): Promise<Response> {
+    try {
+      const body = await request.json().catch(() => ({})) as any;
+      if (!body.user_id || typeof body.user_id !== "string") {
+        return jsonError("VALIDATION_ERROR", "user_id is required", 400);
+      }
+      const bootstrapKey = this.env.AUTH_BOOTSTRAP_KEY;
+      if (bootstrapKey) {
+        if (!body.bootstrap_key || body.bootstrap_key !== bootstrapKey) {
+          return jsonError("UNAUTHORIZED", "Invalid bootstrap key", 401);
+        }
+      }
+      const user = await this.env.incidentiq_db.prepare(
+        "SELECT id FROM users WHERE id = ?"
+      ).bind(body.user_id).first<{ id: string }>();
+      if (!user) {
+        return jsonError("NOT_FOUND", "User not found", 404);
+      }
+      const token = crypto.randomUUID();
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+      await this.env.incidentiq_db.prepare(
+        "INSERT INTO sessions (id, user_id, token, expires_at, created_at) VALUES (?, ?, ?, ?, ?)"
+      ).bind(crypto.randomUUID(), user.id, token, expiresAt.toISOString(), now.toISOString()).run();
+      return json({ data: { user_id: user.id, token, expires_at: expiresAt.toISOString() } });
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
   }
 
   private async handlePingAll(): Promise<Response> {

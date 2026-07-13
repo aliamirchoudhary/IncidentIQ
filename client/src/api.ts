@@ -1,9 +1,23 @@
 const BASE = import.meta.env.VITE_API_BASE ?? "";
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+export function getToken(): string | null {
+  try { return localStorage.getItem("incidentiq_token"); } catch { return null; }
+}
+
+export function setToken(token: string | null) {
+  try { if (token) localStorage.setItem("incidentiq_token", token); else localStorage.removeItem("incidentiq_token"); } catch {}
+}
+
+async function request<T>(method: string, path: string, body?: unknown, skipAuth = false): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (body) headers["Content-Type"] = "application/json";
+  if (!skipAuth) {
+    const token = getToken();
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  }
   const res = await fetch(`${BASE}${path}`, {
     method,
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json();
@@ -12,6 +26,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     throw new Error(msg);
   }
   return json.data as T;
+}
+
+export function generateToken(userId: string, bootstrapKey: string): Promise<{ user_id: string; token: string; expires_at: string }> {
+  return request("POST", "/api/v1/auth/token", { user_id: userId, bootstrap_key: bootstrapKey }, true);
 }
 
 export interface Incident {

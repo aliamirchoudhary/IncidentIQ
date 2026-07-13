@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import * as api from "./api";
 import "./App.css";
 
@@ -10,18 +10,41 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
+  const [token, setTokenState] = useState<string | null>(api.getToken());
+  const [showLogin, setShowLogin] = useState(false);
+
+  useEffect(() => { setTokenState(api.getToken()); }, []);
 
   const showError = (e: unknown) => {
-    setError(e instanceof Error ? e.message : String(e));
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes("401") || msg.includes("UNAUTHORIZED") || msg.includes("Authentication required")) {
+      api.setToken(null);
+      setTokenState(null);
+    }
+    setError(msg);
     setLoading(false);
   };
 
   const nav = (p: Page) => { setPage(p); setError(""); setStatusMsg(""); };
 
+  const handleToken = (t: string) => {
+    api.setToken(t);
+    setTokenState(t);
+    setShowLogin(false);
+  };
+
+  const handleLogout = () => {
+    api.setToken(null);
+    setTokenState(null);
+  };
+
   return (
     <div className="app">
       <header>
-        <h1>IncidentIQ</h1>
+        <div className="header-left">
+          <div className="header-icon">I</div>
+          <h1>IncidentIQ</h1>
+        </div>
         <nav>
           <button onClick={() => nav("submit")} className={page === "submit" ? "active" : ""}>Submit</button>
           <button onClick={() => nav("timeline")} className={page === "timeline" ? "active" : ""}>Timeline</button>
@@ -29,7 +52,16 @@ export default function App() {
           <button onClick={() => nav("report")} className={page === "report" ? "active" : ""}>Report</button>
           <button onClick={() => nav("similar")} className={page === "similar" ? "active" : ""}>Search</button>
         </nav>
+        <div className="auth-status">
+          {token ? (
+            <button className="auth-btn" onClick={handleLogout} title="Clear token">Logout</button>
+          ) : (
+            <button className="auth-btn" onClick={() => setShowLogin(!showLogin)} title="Set API token">Login</button>
+          )}
+        </div>
       </header>
+
+      {showLogin && !token && <LoginForm onToken={handleToken} onError={showError} />}
 
       {error && <div className="error-banner">{error}</div>}
       {loading && <div className="loading-banner">Loading...</div>}
@@ -42,6 +74,47 @@ export default function App() {
         {page === "report" && <ReportPage incidentId={carryId} onError={showError} setLoading={setLoading} />}
         {page === "similar" && <SimilarPage onError={showError} setLoading={setLoading} />}
       </main>
+    </div>
+  );
+}
+
+function LoginForm(props: { onToken: (t: string) => void; onError: (e: unknown) => void }) {
+  const [userId, setUserId] = useState("user-1");
+  const [bootstrapKey, setBootstrapKey] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [pasteToken, setPasteToken] = useState("");
+
+  const handleGenerate = async () => {
+    if (!bootstrapKey.trim()) { props.onError(new Error("Bootstrap key is required")); return; }
+    setLoading(true);
+    try {
+      const res = await api.generateToken(userId.trim(), bootstrapKey.trim());
+      props.onToken(res.token);
+    } catch (e) { props.onError(e); }
+    setLoading(false);
+  };
+
+  const handlePaste = () => {
+    if (!pasteToken.trim()) { props.onError(new Error("Paste a token")); return; }
+    props.onToken(pasteToken.trim());
+  };
+
+  return (
+    <div className="login-form">
+      <div className="login-tabs">
+        <div className="login-section">
+          <h4>Generate Token</h4>
+          <label>User ID<input value={userId} onChange={(e) => setUserId(e.target.value)} /></label>
+          <label>Bootstrap Key<input type="password" value={bootstrapKey} onChange={(e) => setBootstrapKey(e.target.value)} placeholder="From admin" /></label>
+          <button disabled={loading} onClick={handleGenerate}>{loading ? "..." : "Generate"}</button>
+        </div>
+        <div className="login-divider"><span>or</span></div>
+        <div className="login-section">
+          <h4>Paste Token</h4>
+          <label>Token<input value={pasteToken} onChange={(e) => setPasteToken(e.target.value)} placeholder="Paste existing token" /></label>
+          <button onClick={handlePaste}>Use Token</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -274,7 +347,7 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
               <label>Modification note<textarea value={modifications} onChange={(e) => setModifications(e.target.value)} rows={2} /></label>
               <div className="button-row">
                 <button className="btn-approve" onClick={doApprove}>Approve</button>
-                <span style={{ margin: "0 8px" }}>or</span>
+                <span>or</span>
                 <select value={rejectTarget} onChange={(e) => setRejectTarget(e.target.value)}>
                   <option value="TimelineDone">Reject → Timeline</option>
                   <option value="RootCauseDone">Reject → Root Cause</option>
