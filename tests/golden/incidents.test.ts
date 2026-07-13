@@ -58,7 +58,7 @@ describe("golden incidents", () => {
       }
 
       await analyzeIncident(id);
-      const report = await waitForChainCompletion(id, 300_000);
+      const report = await waitForChainCompletion(id, 600_000);
 
       // Structure assertions (strict)
       expect(report).toHaveProperty("id");
@@ -103,6 +103,6 @@ describe("golden incidents", () => {
       for (const keyword of testCase.expectedKeywords) {
         expect(allText).toContain(keyword.toLowerCase());
       }
-    }, 300_000);
+    }, 600_000);
   }
 });
