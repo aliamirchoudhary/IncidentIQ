@@ -7,11 +7,7 @@ const DIRECT_GEMINI_MODEL = "gemini-2.5-flash";
 const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
 const OPENROUTER_MODELS = [
   "google/gemma-4-26b-a4b-it:free",
-  "google/gemma-4-31b-it:free",
-  "cohere/north-mini-code:free",
   "meta-llama/llama-3.3-70b-instruct:free",
-  "qwen/qwen3-coder:free",
-  "nvidia/nemotron-3-super-120b-a12b:free",
   "openrouter/free",
 ];
 const TIMEOUT_MS = 10000;
