@@ -14,7 +14,7 @@ const OPENROUTER_MODELS = [
   "nvidia/nemotron-3-super-120b-a12b:free",
   "openrouter/free",
 ];
-const TIMEOUT_MS = 30000;
+const TIMEOUT_MS = 10000;
 
 interface ToolCall {
   id: string;
@@ -170,7 +170,7 @@ async function tryWorkersAI(messages: LlmMessage[], ai: any): Promise<{ content:
         max_tokens: 2000,
         temperature: 0.3,
       }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 30000)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10000)),
     ]) as any;
     const text = result?.response ?? "";
     if (!text) return null;

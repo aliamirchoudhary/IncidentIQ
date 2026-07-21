@@ -13,7 +13,7 @@ const OPENROUTER_MODELS = [
   "openrouter/free",
 ];
 const DEFAULT_TEMPERATURE = 0.3;
-const TIMEOUT_MS = 30000;
+const TIMEOUT_MS = 10000;
 
 export interface CallLLMOptions {
   systemPrompt: string;
@@ -121,7 +121,7 @@ async function tryWorkersAI(
         temperature,
         stream: false,
       }) as Promise<{ response?: string; choices?: Array<{ message?: { content?: string } }> }>,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 15000)),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10000)),
     ]);
     const text = result.response || result.choices?.[0]?.message?.content || "";
     logLLMEvent("completed", "workers-ai", "direct", "Workers AI call succeeded", { latency_ms: Math.round(performance.now() - t0) });
