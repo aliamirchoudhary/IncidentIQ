@@ -286,6 +286,11 @@ export default class extends WorkerEntrypoint<Env> {
       return addCors(result, origin, this.env);
     }
 
+    const listMatch = method === "GET" && (path === "/api/v1/incidents" || path === "/api/v1/incidents/");
+    if (listMatch) {
+      return addCors(await this.handleListIncidents(url), origin, this.env);
+    }
+
     const similarMatch = method === "GET" && path === "/api/v1/incidents/similar";
     if (similarMatch) {
       return addCors(await this.handleSimilar(url), origin, this.env);
@@ -1263,9 +1268,9 @@ export default class extends WorkerEntrypoint<Env> {
         }, 200);
       }
 
-      const targetState: string = body.target_state ?? "RootCauseDone";
-      if (!["TimelineDone", "RootCauseDone", "PreventionDone"].includes(targetState)) {
-        return jsonError("VALIDATION_ERROR", `Invalid target_state "${targetState}". Must be one of: TimelineDone, RootCauseDone, PreventionDone`, 400);
+      const targetState: string = body.target_state ?? "Validated";
+      if (!["TimelineDone", "Validated", "RootCauseDone"].includes(targetState)) {
+        return jsonError("VALIDATION_ERROR", `Invalid target_state "${targetState}". Must be one of: TimelineDone, Validated, RootCauseDone`, 400);
       }
 
       await this.env.incidentiq_db.prepare(
@@ -1303,6 +1308,24 @@ export default class extends WorkerEntrypoint<Env> {
           reviewId,
         },
       }, 200);
+    } catch (err) {
+      return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
+    }
+  }
+
+  private async handleListIncidents(url: URL): Promise<Response> {
+    try {
+      const statusFilter = url.searchParams.get("status");
+      let query = "SELECT id, title, summary, status, created_at, updated_at FROM incidents WHERE deleted_at IS NULL";
+      const params: string[] = [];
+      if (statusFilter) {
+        query += " AND status = ?";
+        params.push(statusFilter);
+      }
+      query += " ORDER BY created_at DESC LIMIT 100";
+      const stmt = this.env.incidentiq_db.prepare(query);
+      const result = await (params.length > 0 ? stmt.bind(...params) : stmt).all<{ id: string; title: string; summary: string; status: string; created_at: string; updated_at: string }>();
+      return json({ data: { incidents: result.results ?? [] } });
     } catch (err) {
       return jsonError("INTERNAL", err instanceof Error ? err.message : String(err), 500);
     }

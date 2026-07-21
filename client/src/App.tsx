@@ -242,12 +242,24 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
   const [report, setReport] = useState<api.Report | null>(null);
   const [reviewerId, setReviewerId] = useState("user-1");
   const [modifications, setModifications] = useState("");
-  const [rejectTarget, setRejectTarget] = useState("RootCauseDone");
+  const [rejectTarget, setRejectTarget] = useState("Validated");
+  const [pendingList, setPendingList] = useState<api.IncidentSummary[] | null>(null);
 
-  const loadReport = async () => {
-    if (!id.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+  const loadPending = async () => {
     props.setLoading(true);
-    try { setReport(await api.getReport(id.trim())); } catch (e) { props.onError(e); }
+    try {
+      const data = await api.listIncidents("AwaitReview");
+      setPendingList(data.incidents);
+    } catch (e) { props.onError(e); }
+    props.setLoading(false);
+  };
+
+  const loadReport = async (incidentId?: string) => {
+    const targetId = incidentId ?? id;
+    if (!targetId.trim()) { props.onError(new Error("Enter an incident ID")); return; }
+    setId(targetId);
+    props.setLoading(true);
+    try { setReport(await api.getReport(targetId.trim())); } catch (e) { props.onError(e); }
     props.setLoading(false);
   };
 
@@ -258,6 +270,7 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
       await api.submitReview(id.trim(), true, reviewerId.trim(), modifications.trim() || undefined);
       const r = await api.getReport(id.trim());
       setReport(r);
+      setPendingList(null);
       props.setStatus("Approved! State: " + r.status);
     } catch (e) { props.onError(e); }
     props.setLoading(false);
@@ -270,6 +283,7 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
       await api.rejectReview(id.trim(), reviewerId.trim(), rejectTarget, modifications.trim() || undefined);
       const r = await api.getReport(id.trim());
       setReport(r);
+      setPendingList(null);
       props.setStatus("Rejected. State: " + r.status);
     } catch (e) { props.onError(e); }
     props.setLoading(false);
@@ -278,8 +292,30 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
   return (
     <section className="page">
       <h2>Review Dashboard</h2>
+
+      <details style={{ marginBottom: "1rem" }} onToggle={(e) => { if ((e.target as HTMLDetailsElement).open && pendingList === null) loadPending(); }}>
+        <summary style={{ cursor: "pointer", fontWeight: 600 }}>Pending AwaitReview Incidents</summary>
+        {pendingList === null ? (
+          <p style={{ color: "var(--text-muted)", padding: "0.5rem" }}>Loading...</p>
+        ) : pendingList.length === 0 ? (
+          <p style={{ color: "var(--text-muted)", padding: "0.5rem" }}>No incidents awaiting review.</p>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0 }}>
+            {pendingList.map((inc) => (
+              <li key={inc.id} style={{ padding: "0.5rem", borderBottom: "1px solid var(--border)", cursor: "pointer" }}
+                  onClick={() => loadReport(inc.id)}>
+                <strong>{inc.title}</strong>
+                <span style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginLeft: "0.5rem" }}>
+                  {new Date(inc.created_at).toLocaleDateString()}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
+
       <label>Incident ID<input value={id} onChange={(e) => setId(e.target.value)} placeholder="Paste incident ID" /></label>
-      <button onClick={loadReport}>Load Report</button>
+      <button onClick={() => loadReport()}>Load Report</button>
 
       {report && (
         <>
@@ -357,8 +393,8 @@ function ReviewPage(props: { incidentId: string; onError: (e: unknown) => void; 
                 <span>or</span>
                 <select value={rejectTarget} onChange={(e) => setRejectTarget(e.target.value)}>
                   <option value="TimelineDone">Reject → Timeline</option>
-                  <option value="RootCauseDone">Reject → Root Cause</option>
-                  <option value="PreventionDone">Reject → Prevention</option>
+                  <option value="Validated">Reject → Root Cause</option>
+                  <option value="RootCauseDone">Reject → Prevention</option>
                 </select>
                 <button className="btn-reject" onClick={doReject}>Reject</button>
               </div>

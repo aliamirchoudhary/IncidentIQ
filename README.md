@@ -120,7 +120,7 @@ Validated ──(RootCauseAgent)──▶ RootCauseDone
 RootCauseDone ──(PreventionAgent)──▶ PreventionDone
 PreventionDone ──(ModeratorAgent)──▶ AwaitReview
 AwaitReview ──(human: approve)──▶ Finalized
-AwaitReview ──(human: reject)──▶ TimelineDone / RootCauseDone / PreventionDone
+AwaitReview ──(human: reject)──▶ TimelineDone / Validated / RootCauseDone
 Finalized ──▶ (terminal)
 ```
 
@@ -165,6 +165,7 @@ The `callLLM` utility makes one attempt per tier then returns a typed error. Who
 |---|---|---|---|
 | `POST` | `/incidents` | Bearer | Best-effort |
 | `POST` | `/incidents/{id}/events` | Bearer | Yes (key) |
+| `GET` | `/incidents?status=` | None | Read |
 | `GET` | `/incidents/{id}` | None | Read |
 | `GET` | `/incidents/{id}/report` | None | Read |
 | `POST` | `/incidents/{id}/analyze` | Bearer | Safe to retry |

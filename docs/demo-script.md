@@ -302,7 +302,7 @@ curl -s -X POST "$API/incidents/$INCIDENT/review" \
   -d '{
     "reviewer_user_id": "demo-reviewer",
     "approved": false,
-    "target_state": "prevention",
+    "target_state": "RootCauseDone",
     "modifications": "The prevention recommendations should also include adding an RDS proxy layer"
   }' | jq
 ```

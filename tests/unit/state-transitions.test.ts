@@ -12,7 +12,7 @@ const ALLOWED_TRANSITIONS: Record<IncidentState, IncidentState[]> = {
   Validated: ["RootCauseDone"],
   RootCauseDone: ["PreventionDone"],
   PreventionDone: ["AwaitReview"],
-  AwaitReview: ["Finalized", "TimelineDone", "RootCauseDone", "PreventionDone"],
+  AwaitReview: ["Finalized", "TimelineDone", "Validated", "RootCauseDone"],
   Finalized: [],
 };
 
@@ -46,10 +46,10 @@ describe("state machine transitions", () => {
     expect(isAllowed("AwaitReview", "Finalized")).toBe(true);
   });
 
-  it("allows AwaitReview rollback to TimelineDone, RootCauseDone, PreventionDone", () => {
+  it("allows AwaitReview rollback to TimelineDone, Validated, RootCauseDone", () => {
     expect(isAllowed("AwaitReview", "TimelineDone")).toBe(true);
+    expect(isAllowed("AwaitReview", "Validated")).toBe(true);
     expect(isAllowed("AwaitReview", "RootCauseDone")).toBe(true);
-    expect(isAllowed("AwaitReview", "PreventionDone")).toBe(true);
   });
 
   it("rejects Finalized → any state", () => {

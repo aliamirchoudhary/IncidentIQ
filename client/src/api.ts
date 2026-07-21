@@ -133,3 +133,17 @@ export function rejectReview(incidentId: string, reviewerUserId: string, targetS
 export function searchSimilar(query: string, k = 5): Promise<{ query: string; k: number; results: SimilarResult[] }> {
   return request("GET", `/api/v1/incidents/similar?query=${encodeURIComponent(query)}&k=${k}`);
 }
+
+export interface IncidentSummary {
+  id: string;
+  title: string;
+  summary: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listIncidents(status?: string): Promise<{ incidents: IncidentSummary[] }> {
+  const params = status ? `?status=${encodeURIComponent(status)}` : "";
+  return request("GET", `/api/v1/incidents${params}`);
+}
