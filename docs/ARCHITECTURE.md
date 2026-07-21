@@ -11,8 +11,11 @@ the deterministic Validation Gate. When an engineer submits events, core-api
 calls four separate **stateless agent Workers** (TimelineAgent,
 RootCauseAgent, PreventionAgent, ModeratorAgent) via Service Binding RPC —
 never HTTP. Each agent is a pure function: it receives structured input,
-optionally calls an LLM through Cloudflare AI Gateway (Gemini primary,
-OpenRouter fallback), and returns structured output. core-api never calls an
+optionally calls an LLM through one of four independent providers:
+Cloudflare Workers AI (primary), OpenRouter (secondary fallback),
+Cloudflare AI Gateway (tertiary), or Direct Gemini (last resort).
+Each provider has its own free quota, and the chain is tried in order.
+Agents return structured output. core-api never calls an
 LLM itself; its job is strictly orchestration + persistence.
 
 Agents have no knowledge of each other or direct access to D1 or the
@@ -209,7 +212,7 @@ When Validation Gate returns `valid: false`:
 | **Validation Gate's "contradictory events" check is fuzzy** | Low | Keep it a shallow deterministic check (near-duplicate timestamps with conflicting descriptions). Don't let this become an NLP problem. Document it as a known limitation, not a solved capability. |
 | **Cross-incident memory and RAG sharing storage with different lifecycle needs** | Low | The `type` column (`runbook` vs `past_incident`) separates them. In a real product they'd want separate ingestion pipelines — worth noting, not worth building now. |
 | **No load testing against real concurrent volume** | Medium | DO-per-incident model should scale in principle. Flag as a known gap in README rather than pretending it was validated. Not blocking for this challenge. |
-| **LLM provider downtime during a pipeline run** | Medium | Dual-provider architecture (Gemini → OpenRouter). `callLLM` attempts primary → fallback once each, then returns typed error. Whole-call retry is core-api's job (3 attempts with backoff). Document that a production version would want AI Gateway-level dynamic routing as that feature matures. |
+| **LLM provider downtime during a pipeline run** | Medium | Four-provider architecture (Workers AI → OpenRouter → Gateway → Direct Gemini). Each has independent free quota. `callLLM` attempts all four in sequence, then returns typed error. Whole-call retry is core-api's job (3 attempts with backoff). Document that a production version would want AI Gateway-level dynamic routing as that feature matures. |
 | **Prompt injection from user-supplied events** | Medium | Delineate data from instructions in prompts using clear delimiters. `knowledge_sources` ingestion is authenticated (no public upload). Document residual risk in README. |
 | **Stale knowledge documents producing bad reasoning** | Low | Out of scope to build staleness detection. Document in README as known limitation (`last_reviewed_at` field + review process would address this in production). |
 | **Accidental single-Worker refactoring** | Critical | Architecture Principle §1.2 (single responsibility) and §1.9 (agents never directly invoke each other) explicitly guard against collapsing the 5-worker architecture. During code review, watch for any import of agent-worker types into another agent-worker, or core-api making its own LLM call. |

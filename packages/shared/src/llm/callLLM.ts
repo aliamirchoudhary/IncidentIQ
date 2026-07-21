@@ -3,7 +3,15 @@ const GATEWAY_MODEL = "google-ai-studio/gemini-2.5-flash";
 const DIRECT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DIRECT_GEMINI_MODEL = "gemini-2.5-flash";
 const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
-const OPENROUTER_MODEL = "openai/gpt-4o-mini";
+const OPENROUTER_MODELS = [
+  "google/gemma-4-26b-a4b-it:free",
+  "google/gemma-4-31b-it:free",
+  "cohere/north-mini-code:free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "qwen/qwen3-coder:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "openrouter/free",
+];
 const DEFAULT_TEMPERATURE = 0.3;
 const TIMEOUT_MS = 30000;
 
@@ -16,12 +24,13 @@ export interface CallLLMOptions {
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
     CLOUDFLARE_API_TOKEN?: string;
+    AI?: any;
   };
 }
 
 export interface CallLLMResult {
   text: string;
-  provider: "gemini" | "openrouter";
+  provider: "gemini" | "openrouter" | "workers-ai";
   route: "gateway" | "direct";
   model: string;
 }
@@ -29,25 +38,21 @@ export interface CallLLMResult {
 export interface CallLLMError {
   ok: false;
   error: string;
-  provider: "gemini" | "openrouter" | null;
+  provider: "gemini" | "openrouter" | "workers-ai" | null;
   route: "gateway" | "direct" | null;
 }
 
 export type CallLLMResponse = CallLLMResult | CallLLMError;
 
 async function post(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
+  return Promise.race([
+    fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs)),
+  ]);
 }
 
 async function callProvider(
@@ -99,6 +104,34 @@ function logLLMEvent(event: string, provider: string, route: string, detail: str
   }));
 }
 
+async function tryWorkersAI(
+  systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
+  env: { AI?: any },
+): Promise<CallLLMResult | null> {
+  if (!env.AI) return null;
+  const t0 = performance.now();
+  try {
+    const result = await Promise.race([
+      env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        max_tokens: maxTokens,
+        temperature,
+        stream: false,
+      }) as Promise<{ response?: string; choices?: Array<{ message?: { content?: string } }> }>,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 15000)),
+    ]);
+    const text = result.response || result.choices?.[0]?.message?.content || "";
+    logLLMEvent("completed", "workers-ai", "direct", "Workers AI call succeeded", { latency_ms: Math.round(performance.now() - t0) });
+    return { text, provider: "workers-ai", route: "direct", model: "@cf/meta/llama-3.1-8b-instruct-fp8" };
+  } catch (err) {
+    logLLMEvent("completed", "workers-ai", "direct", "Workers AI call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
+    return null;
+  }
+}
+
 async function tryGateway(
   systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
   env: { CLOUDFLARE_API_TOKEN?: string },
@@ -145,19 +178,29 @@ async function tryOpenRouter(
   env: { OPENROUTER_API_KEY?: string },
 ): Promise<CallLLMResult | null> {
   const t0 = performance.now();
-  try {
-    const result = await callProvider(
-      OPENROUTER_API_BASE,
-      { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` },
-      OPENROUTER_MODEL,
-      systemPrompt, userPrompt, maxTokens, temperature,
-    );
-    logLLMEvent("completed", "openrouter", "direct", "OpenRouter call succeeded", { latency_ms: Math.round(performance.now() - t0) });
-    return { text: result.text, provider: "openrouter", route: "direct", model: OPENROUTER_MODEL };
-  } catch (err) {
-    logLLMEvent("completed", "openrouter", "direct", "OpenRouter call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
-    return null;
+  for (const model of OPENROUTER_MODELS) {
+    try {
+      const result = await callProvider(
+        OPENROUTER_API_BASE,
+        { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` },
+        model,
+        systemPrompt, userPrompt, maxTokens, temperature,
+      );
+      logLLMEvent("completed", "openrouter", "direct", `OpenRouter ${model} succeeded`, { latency_ms: Math.round(performance.now() - t0) });
+      return { text: result.text, provider: "openrouter", route: "direct", model };
+    } catch (err) {
+      logLLMEvent("completed", "openrouter", "direct", `OpenRouter ${model} failed: ${err instanceof Error ? err.message : String(err)}`, { latency_ms: Math.round(performance.now() - t0) });
+    }
   }
+  return null;
+}
+
+function isErrorContent(text: string | null | undefined): boolean {
+  if (!text) return true;
+  const start = text.substring(0, 100).toLowerCase();
+  return start.includes("error") || start.includes("unavailable") || start.includes("quota") ||
+    start.includes("rate limit") || start.includes("too many") || start.includes("429") ||
+    start.includes("insufficient") || start.includes("upstream") || start.includes("overloaded");
 }
 
 export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
@@ -167,10 +210,24 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
     return { ok: false, error: "GEMINI_API_KEY is required", provider: null, route: null };
   }
 
-  const result =
-    (await tryGateway(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env)) ??
-    (await tryDirectGemini(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env)) ??
-    (opts.env.OPENROUTER_API_KEY ? await tryOpenRouter(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env) : null);
+  let result: CallLLMResult | null = null;
+
+  if (opts.env.AI) {
+    result = await tryWorkersAI(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
+    if (isErrorContent(result?.text)) result = null;
+  }
+  if (!result && opts.env.OPENROUTER_API_KEY) {
+    result = await tryOpenRouter(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
+    if (isErrorContent(result?.text)) result = null;
+  }
+  if (!result && opts.env.CLOUDFLARE_API_TOKEN) {
+    result = await tryGateway(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
+    if (isErrorContent(result?.text)) result = null;
+  }
+  if (!result) {
+    result = await tryDirectGemini(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
+    if (isErrorContent(result?.text)) result = null;
+  }
 
   if (result) return result;
 

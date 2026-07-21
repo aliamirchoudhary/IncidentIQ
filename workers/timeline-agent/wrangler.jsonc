@@ -19,6 +19,9 @@
       "new_sqlite_classes": ["TimelineAgent"]
     }
   ],
+  "ai": {
+    "binding": "AI"
+  },
   "observability": {
     "logs": {
       "enabled": true,

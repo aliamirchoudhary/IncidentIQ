@@ -5,8 +5,16 @@ const GATEWAY_MODEL = "google-ai-studio/gemini-2.5-flash";
 const DIRECT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai";
 const DIRECT_GEMINI_MODEL = "gemini-2.5-flash";
 const OPENROUTER_API_BASE = "https://openrouter.ai/api/v1";
-const OPENROUTER_MODEL = "openai/gpt-4o-mini";
-const TIMEOUT_MS = 45000;
+const OPENROUTER_MODELS = [
+  "google/gemma-4-26b-a4b-it:free",
+  "google/gemma-4-31b-it:free",
+  "cohere/north-mini-code:free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "qwen/qwen3-coder:free",
+  "nvidia/nemotron-3-super-120b-a12b:free",
+  "openrouter/free",
+];
+const TIMEOUT_MS = 30000;
 
 interface ToolCall {
   id: string;
@@ -56,18 +64,14 @@ const STATUS_CORRELATOR_TOOL: ToolDefinition = {
 };
 
 async function post(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, {
+  return Promise.race([
+    fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
       body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), timeoutMs)),
+  ]);
 }
 
 async function callProvider(
@@ -138,14 +142,40 @@ async function tryDirectGemini(messages: LlmMessage[], tools: ToolDefinition[], 
 }
 
 async function tryOpenRouter(messages: LlmMessage[], tools: ToolDefinition[], apiKey: string): Promise<{ content: string | null; tool_calls: ToolCall[] | null } | null> {
+  for (const model of OPENROUTER_MODELS) {
+    try {
+      const result = await callProvider(
+        OPENROUTER_API_BASE,
+        { Authorization: `Bearer ${apiKey}` },
+        model,
+        messages,
+        tools,
+      );
+      if (result && (result.content || (result.tool_calls && result.tool_calls.length > 0))) {
+        return result;
+      }
+    } catch (err) {
+      console.log(`OpenRouter ${model} failed:`, err instanceof Error ? err.message : String(err));
+    }
+  }
+  return null;
+}
+
+async function tryWorkersAI(messages: LlmMessage[], ai: any): Promise<{ content: string | null; tool_calls: ToolCall[] | null } | null> {
+  if (!ai) return null;
   try {
-    return await callProvider(
-      OPENROUTER_API_BASE,
-      { Authorization: `Bearer ${apiKey}` },
-      OPENROUTER_MODEL,
-      messages,
-      tools,
-    );
+    const result = await Promise.race([
+      ai.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
+        messages: messages.map(m => ({ role: m.role, content: m.content ?? "" })),
+        max_tokens: 2000,
+        temperature: 0.3,
+      }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 30000)),
+    ]) as any;
+    const text = result?.response ?? "";
+    if (!text) return null;
+    if (text.length < 20) return null;
+    return { content: text, tool_calls: null };
   } catch {
     return null;
   }
@@ -168,6 +198,7 @@ export async function callLLMWithTools(
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
     CLOUDFLARE_API_TOKEN?: string;
+    AI?: any;
   },
 ): Promise<FunctionCallResult | { ok: false; error: string }> {
   if (!env.GEMINI_API_KEY) {
@@ -179,38 +210,74 @@ export async function callLLMWithTools(
     { role: "user", content: userPrompt },
   ];
 
+  let firstResponse = null;
   let provider = "gemini", route = "gateway", model = GATEWAY_MODEL;
 
-  let firstResponse = null;
-  if (env.CLOUDFLARE_API_TOKEN) {
-    firstResponse = await tryGateway(messages, tools, env.CLOUDFLARE_API_TOKEN);
-    route = "gateway";
+  function hasErrorContent(c: string | null | undefined): boolean {
+    if (!c) return true;
+    const start = c.substring(0, 120).toLowerCase();
+    return start.includes("error") || start.includes("unavailable") || start.includes("quota") ||
+      start.includes("rate limit") || start.includes("too many") || start.includes("429") ||
+      start.includes("insufficient") || start.includes("upstream") || start.includes("overloaded") ||
+      start.includes("i'm sorry") || start.includes("cannot process") || start.includes("try again");
   }
-  if (!firstResponse) {
+
+  function isValidResponse(r: { content: string | null; tool_calls: ToolCall[] | null } | null): boolean {
+    if (!r) return false;
+    if (r.content && !hasErrorContent(r.content)) return true;
+    if (r.tool_calls && r.tool_calls.length > 0) return true;
+    return false;
+  }
+
+  if (env.AI) {
+    firstResponse = await tryWorkersAI(messages, env.AI);
+    if (isValidResponse(firstResponse)) {
+      provider = "workers-ai";
+      route = "direct";
+      model = "llama-3.1-8b";
+    }
+  }
+
+  if (!isValidResponse(firstResponse) && env.OPENROUTER_API_KEY) {
+    firstResponse = await tryOpenRouter(messages, tools, env.OPENROUTER_API_KEY);
+    if (!isValidResponse(firstResponse)) {
+      firstResponse = await tryOpenRouter(messages, [], env.OPENROUTER_API_KEY);
+    }
+    if (isValidResponse(firstResponse)) {
+      provider = "openrouter";
+      route = "direct";
+      model = "openrouter";
+    }
+  }
+
+  if (!isValidResponse(firstResponse)) {
+    if (env.CLOUDFLARE_API_TOKEN) {
+      firstResponse = await tryGateway(messages, tools, env.CLOUDFLARE_API_TOKEN);
+      if (!isValidResponse(firstResponse)) firstResponse = null;
+    }
+  }
+  if (!isValidResponse(firstResponse)) {
     firstResponse = await tryDirectGemini(messages, tools, env.GEMINI_API_KEY);
+    if (!isValidResponse(firstResponse)) firstResponse = null;
     provider = "gemini";
     route = "direct";
   }
-  if (!firstResponse && env.OPENROUTER_API_KEY) {
-    firstResponse = await tryOpenRouter(messages, tools, env.OPENROUTER_API_KEY);
-    provider = "openrouter";
-    route = "direct";
-  }
 
-  if (!firstResponse) {
+  if (!isValidResponse(firstResponse)) {
     return { ok: false, error: "All LLM providers failed" };
   }
 
+  const r = firstResponse!;
   const toolInvocations: ToolInvocation[] = [];
 
-  if (firstResponse.tool_calls && firstResponse.tool_calls.length > 0) {
+  if (r.tool_calls && r.tool_calls.length > 0) {
     messages.push({
       role: "assistant",
       content: null,
-      tool_calls: firstResponse.tool_calls,
+      tool_calls: r.tool_calls,
     });
 
-    for (const tc of firstResponse.tool_calls) {
+    for (const tc of r.tool_calls) {
       if (tc.function.name === "status_correlator") {
         let args: { service: string };
         try {
@@ -232,18 +299,25 @@ export async function callLLMWithTools(
       }
     }
 
-    if (firstResponse.content !== null && firstResponse.content !== undefined) {
+    if (r.content !== null && r.content !== undefined) {
     }
 
     let secondResponse = null;
-    if (env.CLOUDFLARE_API_TOKEN) {
-      secondResponse = await tryGateway(messages, [], env.CLOUDFLARE_API_TOKEN);
+    if (env.AI) {
+      secondResponse = await tryWorkersAI(messages, env.AI);
     }
-    if (!secondResponse) {
-      secondResponse = await tryDirectGemini(messages, [], env.GEMINI_API_KEY);
-    }
-    if (!secondResponse && env.OPENROUTER_API_KEY) {
+    if (!isValidResponse(secondResponse) && env.OPENROUTER_API_KEY) {
       secondResponse = await tryOpenRouter(messages, [], env.OPENROUTER_API_KEY);
+    }
+    if (!isValidResponse(secondResponse)) {
+      if (env.CLOUDFLARE_API_TOKEN) {
+        secondResponse = await tryGateway(messages, [], env.CLOUDFLARE_API_TOKEN);
+        if (!isValidResponse(secondResponse)) secondResponse = null;
+      }
+      if (!isValidResponse(secondResponse)) {
+        secondResponse = await tryDirectGemini(messages, [], env.GEMINI_API_KEY);
+        if (!isValidResponse(secondResponse)) secondResponse = null;
+      }
     }
 
     if (!secondResponse) {
@@ -260,7 +334,7 @@ export async function callLLMWithTools(
   }
 
   return {
-    text: firstResponse.content ?? "",
+    text: r.content ?? "",
     tool_invocations: toolInvocations,
     provider,
     route,

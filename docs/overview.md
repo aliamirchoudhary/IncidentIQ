@@ -69,25 +69,26 @@ graph LR
     A\\\[Engineer / SRE]
   end
   subgraph Cloudflare Stack
-    W1\\\[Ingestion Worker (Agent)]
-    W2\\\[Timeline Worker]
-    W3\\\[RootCause Worker]
-    W4\\\[Prevention Worker]
-    W5\\\[Moderator Worker]
-    DO\\\[Durable Object: Incident Room]
-    DB\\\[D1 SQL Database (Incident KB)]
+    CORE\\\[CoreApi (Orchestrator)]
+    W1\\\[Ingestion Agent (Worker + DO)]
+    W2\\\[Timeline Agent (Worker + DO)]
+    W3\\\[RootCause Agent (Worker + DO)]
+    W4\\\[Prevention Agent (Worker + DO)]
+    W5\\\[Moderator Agent (Worker + DO)]
+    DB\\\[D1 SQL Database]
+    LLM\\\[LLM Providers: Workers AI / OpenRouter / Gateway / Gemini]
   end
-  A -- submits data --> W1
-  W1 -- writes incident data --> DO
-  DO -- triggers timeline analysis --> W2
-  W2 -- writes timeline events --> DO
-  DO -- triggers root-cause agent --> W3
-  W3 -- writes root cause --> DO
-  DO -- triggers prevention agent --> W4
-  W4 -- writes recommendations --> DO
-  DO -- notifies ready for review --> W5
-  W5 -- finalizes report --> DO
-  DO -- saves report --> DB
+  A -- HTTP API --> CORE
+  CORE -- reads/writes --> DB
+  CORE -- RPC --> W1
+  CORE -- RPC --> W2
+  CORE -- RPC --> W3
+  CORE -- RPC --> W4
+  CORE -- RPC --> W5
+  W2 -- Workers AI --> LLM
+  W3 -- Workers AI --> LLM
+  W4 -- Workers AI --> LLM
+  W5 -- Workers AI --> LLM
 ```
 
 This diagram shows the **multi-agent workflow** on Cloudflare: each box W1–W5 is a Cloudflare Worker running an Agents SDK agent, coordinating via a shared Durable Object and storing final results in D1.
@@ -120,18 +121,20 @@ Each incident has a **Durable Object (Incident Room)** that orchestrates the mul
 
 ```mermaid
 stateDiagram-v2
-    \\\[\\\*] --> Ingested
+    \\\[\\\*\\] --> Ingested
     Ingested --> TimelineDone: Timeline Agent completes
-    TimelineDone --> RootCauseDone: Root-Cause Agent completes
+    TimelineDone --> Validated: Validation Gate passes
+    Validated --> RootCauseDone: Root-Cause Agent completes
     RootCauseDone --> PreventionDone: Prevention Agent completes
-    PreventionDone --> AwaitReview: Ready for HITL
+    PreventionDone --> AwaitReview: Moderator Agent completes
     AwaitReview --> Finalized: Human approved
     AwaitReview --> RootCauseDone: Reviewer requests recalc
     AwaitReview --> TimelineDone: Reviewer adjusts timeline
     AwaitReview --> PreventionDone: Reviewer adjusts recommendations
 ```
 
-* **States:** *Ingested, TimelineDone, RootCauseDone, PreventionDone, AwaitReview, Finalized*.
+* **States:** *Ingested, TimelineDone, Validated, RootCauseDone, PreventionDone, AwaitReview, Finalized*.
+* **Validation Gate:** Automated check that timeline entries match input events (no hallucinated entries). If validation fails, the chain stops and flags issues for human review.
 * **Transitions:** Agents write their output to the DO and advance state. For example, once the Timeline Agent writes results, the DO moves to `TimelineDone` and triggers the Root-Cause Agent. If the human reviewer requests a change (e.g. “wrong timeline”), the DO can revert to an earlier state and re-trigger agents.
 * The DO holds all partial results (lists of events, causes, etc.) in memory and persists them (Durable Objects have built-in storage). It ensures only one state-machine instance per incident (IDs based on `incident\\\_id`).
 
@@ -191,18 +194,25 @@ Each agent uses LLM prompts crafted for its task. Example templates (in pseudoco
 
   ## LLM Providers, Cost \& Fallback Strategy
 
-  We must choose models with free tiers or low cost:
+  We chain multiple free providers with independent rate limits to maximize reliability:
 
-* **OpenRouter:** Provides access to many open/free models. For example, **OpenRouter’s “free models”** pool offers models like NVIDIA Nemotron and Laguna that incur no cost【24†L59-L67】. We can use the special endpoint `openrouter/free` which automatically picks an available free model【41†L1-L4】. This gives us zero-cost inference for development.
-* **Google Gemini (Vertex AI):** Google’s Gemini models have a free tier. For instance, *Gemini 2.5 Flash-Lite (Standard)* is free for text input/output【28†L936-L940】. We can configure Cloudflare AI Gateway to use `gemini-2.5-flash-lite` in text mode, staying within free usage (GPT-comparable quality). If higher capacity is needed, Google’s pricing is \~$0.40/1M output tokens【28†L936-L940】.
-* **Other Open Models:** We can also use HuggingFace-accessible models (e.g. LLaMA 2, Mistral) via OpenRouter or directly. Those are free but may be slower. We will configure environment variables (or Agents SDK bindings) so that swapping providers is trivial (e.g. use `OR\\\_PROVIDER=openrouter` or `GEMINI\\\_API\\\_KEY` etc).
-* **Fallbacks:** If one model is unavailable, our Agents SDK can catch errors and retry with another. For example, if OpenRouter’s free pool is exhausted, fall back to `Gemini-1.5B`. If Google’s service faces rate limits, fall back to an OpenRouter free model. The Agents SDK makes it easy to configure multiple tools or retry strategies.
+* **Cloudflare Workers AI (Primary):** Uses `@cf/meta/llama-3.1-8b-instruct-fp8` via the `AI` binding on each Worker. This has its own daily quota separate from Gemini/OpenRouter, making it the ideal first choice. It is tried first in every LLM call.
+* **OpenRouter (Secondary Fallback):** Chains 7 free models in sequence: `google/gemma-4-26b-a4b-it:free`, `google/gemma-4-31b-it:free`, `cohere/north-mini-code:free`, `meta-llama/llama-3.3-70b-instruct:free`, `qwen/qwen3-coder:free`, `nvidia/nemotron-3-super-120b-a12b:free`, `openrouter/free`. Supports `:free` suffix to avoid billing. If a model fails (rate limit, exhaustion, error), the next is tried automatically. Some free models do not support function calling, so we retry without tools when a tool-call attempt fails.
+* **Cloudflare AI Gateway (Tertiary):** Routes to Gemini 2.5 Flash via Cloudflare AI Gateway using a shared `CLOUDFLARE_API_TOKEN`. Shares rate limit with Direct Gemini (both use the same Gemini API key).
+* **Direct Gemini Fallback (Last Resort):** Calls the Gemini OpenAI-compatible endpoint directly. Uses the same API key as Gateway, so both fail when quota is exhausted.
+
+  **Provider Chain Order:**
+  1. Cloudflare Workers AI (`AI` binding, independent quota)
+  2. OpenRouter (7 free models with retry-without-tools)
+  3. Cloudflare AI Gateway (Gemini via gateway)
+  4. Direct Gemini (OpenAI-compatible endpoint)
 
   **Cost/Limit Summary:**
 
-* OpenRouter/free: $0 (subject to fair-use limits, usually generous for demos).
-* Google Gemini (Flash-Lite): 1M tokens free per month. Paid only beyond that (by then we have proof-of-concept).
-* (Optionally) ChatGPT-style APIs **should not** be used due to cost. If needed as ultimate fallback, it would be external.
+* Cloudflare Workers AI: Free daily quota (separate from other providers, most reliable for demo).
+* OpenRouter/free: $0 for specified models (subject to fair-use limits and availability).
+* Google Gemini (Flash): Free tier available monthly.
+* All providers are independent — if one is exhausted, others remain available.
 
   See Google’s pricing page for Gemini (July 2026)【28†L936-L940】 and OpenRouter’s free-model policy【24†L59-L67】【41†L1-L4】 for details.
 

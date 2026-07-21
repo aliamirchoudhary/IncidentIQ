@@ -209,7 +209,7 @@ function getRoom(env: Env, id: string): DurableObjectStub<IncidentRoom> {
 }
 
 function getAgentStub(ns: DurableObjectNamespace): DurableObjectStub {
-  return ns.get(ns.idFromName("default"));
+  return ns.get(ns.idFromName("v17"));
 }
 
 export default class extends WorkerEntrypoint<Env> {
