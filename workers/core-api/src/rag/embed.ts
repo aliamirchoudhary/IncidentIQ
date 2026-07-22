@@ -6,8 +6,13 @@ export interface AiRuntime {
   run(model: string, input: { text: string[] }): Promise<{ data: number[][] }>;
 }
 
+const EMBED_TIMEOUT_MS = 10000;
+
 export async function generateEmbedding(text: string, ai: AiRuntime): Promise<number[]> {
-  const result = await ai.run(EMBEDDING_MODEL, { text: [text] });
+  const result = await Promise.race([
+    ai.run(EMBEDDING_MODEL, { text: [text] }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), EMBED_TIMEOUT_MS)),
+  ]) as any;
   const embedding = result.data?.[0];
   if (!embedding || !Array.isArray(embedding)) {
     throw new Error("Unexpected embedding response format");

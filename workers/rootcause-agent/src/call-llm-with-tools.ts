@@ -187,7 +187,7 @@ export interface FunctionCallResult {
 
 const tools = [STATUS_CORRELATOR_TOOL];
 
-export async function callLLMWithTools(
+async function _callLLMWithTools(
   systemPrompt: string,
   userPrompt: string,
   env: {
@@ -225,16 +225,7 @@ export async function callLLMWithTools(
     return false;
   }
 
-  if (env.AI) {
-    firstResponse = await tryWorkersAI(messages, env.AI);
-    if (isValidResponse(firstResponse)) {
-      provider = "workers-ai";
-      route = "direct";
-      model = "llama-3.1-8b";
-    }
-  }
-
-  if (!isValidResponse(firstResponse) && env.OPENROUTER_API_KEY) {
+  if (env.OPENROUTER_API_KEY) {
     firstResponse = await tryOpenRouter(messages, tools, env.OPENROUTER_API_KEY);
     if (!isValidResponse(firstResponse)) {
       firstResponse = await tryOpenRouter(messages, [], env.OPENROUTER_API_KEY);
@@ -257,6 +248,14 @@ export async function callLLMWithTools(
     if (!isValidResponse(firstResponse)) firstResponse = null;
     provider = "gemini";
     route = "direct";
+  }
+  if (!isValidResponse(firstResponse) && env.AI) {
+    firstResponse = await tryWorkersAI(messages, env.AI);
+    if (isValidResponse(firstResponse)) {
+      provider = "workers-ai";
+      route = "direct";
+      model = "llama-3.1-8b";
+    }
   }
 
   if (!isValidResponse(firstResponse)) {
@@ -299,10 +298,7 @@ export async function callLLMWithTools(
     }
 
     let secondResponse = null;
-    if (env.AI) {
-      secondResponse = await tryWorkersAI(messages, env.AI);
-    }
-    if (!isValidResponse(secondResponse) && env.OPENROUTER_API_KEY) {
+    if (env.OPENROUTER_API_KEY) {
       secondResponse = await tryOpenRouter(messages, [], env.OPENROUTER_API_KEY);
     }
     if (!isValidResponse(secondResponse)) {
@@ -314,6 +310,9 @@ export async function callLLMWithTools(
         secondResponse = await tryDirectGemini(messages, [], env.GEMINI_API_KEY);
         if (!isValidResponse(secondResponse)) secondResponse = null;
       }
+    }
+    if (!isValidResponse(secondResponse) && env.AI) {
+      secondResponse = await tryWorkersAI(messages, env.AI);
     }
 
     if (!secondResponse) {
@@ -336,4 +335,22 @@ export async function callLLMWithTools(
     route,
     model,
   };
+}
+
+const LLM_TIMEOUT_MS = 60000;
+
+export async function callLLMWithTools(
+  systemPrompt: string,
+  userPrompt: string,
+  env: {
+    GEMINI_API_KEY: string;
+    OPENROUTER_API_KEY?: string;
+    CLOUDFLARE_API_TOKEN?: string;
+    AI?: any;
+  },
+): Promise<FunctionCallResult | { ok: false; error: string }> {
+  return Promise.race([
+    _callLLMWithTools(systemPrompt, userPrompt, env),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), LLM_TIMEOUT_MS)),
+  ]).catch(() => ({ ok: false, error: "All LLM providers failed" }));
 }

@@ -1,4 +1,5 @@
 import { IncidentRoom } from "./incident-room";
+import { rpcTimeout, RPC_TIMEOUT } from "./index";
 
 interface Env {
   INCIDENT_ROOM: DurableObjectNamespace<IncidentRoom>;
@@ -82,8 +83,8 @@ export async function createIncident(
       "INSERT INTO incidents (id, title, summary, status, created_at, updated_at) VALUES (?, ?, ?, 'Ingested', ?, ?)"
     ).bind(id, title, summary, now, now).run();
 
-    await room.setIncident({ id, title, summary });
-    const state = await room.getState() as any;
+    await rpcTimeout(room.setIncident({ id, title, summary }), RPC_TIMEOUT.transition, "room.setIncident");
+    const state = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState") as any;
     await logActivity(db, id, "IngestionAgent", requestId, state.version, "completed", "incident_created", `Incident "${title}" created`);
 
     return jsonResponse({ id, title, summary, status: "Ingested", version: state.version, createdAt: now }, 201);
@@ -137,7 +138,7 @@ export async function addEvent(
     const eventId = makeId();
     const now = new Date().toISOString();
 
-    const doResult = await room.addEvent({ timestamp, detail, source: source ?? undefined }) as any;
+    const doResult = await rpcTimeout(room.addEvent({ timestamp, detail, source: source ?? undefined }), RPC_TIMEOUT.transition, "room.addEvent") as any;
 
     await db.prepare(
       "INSERT INTO incident_events (id, incident_id, timestamp, detail, source, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -173,7 +174,7 @@ export async function getIncident(
     }
 
     const room = getRoom(env, incidentId);
-    const state = await room.getState();
+    const state = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
 
     const eventsRow = await db.prepare(
       "SELECT COUNT(*) as count FROM incident_events WHERE incident_id = ?"
@@ -209,7 +210,7 @@ export async function getReport(
     }
 
     const room = getRoom(env, incidentId);
-    const state = await room.getState();
+    const state = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
 
     const events = await db.prepare(
       "SELECT id, timestamp, detail, source, created_at FROM incident_events WHERE incident_id = ? ORDER BY created_at ASC"
@@ -234,7 +235,7 @@ export async function getReport(
     let reportData: any = null;
     let rootCauseFromDO: any = null;
     try {
-      const data = await (room as any).getData();
+      const data = await rpcTimeout((room as any).getData(), RPC_TIMEOUT.transition, "room.getData");
       if (data) {
         reportData = data.report ?? null;
         rootCauseFromDO = data.rootCause ?? null;

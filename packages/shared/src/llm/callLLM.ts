@@ -199,7 +199,7 @@ function isErrorContent(text: string | null | undefined): boolean {
     start.includes("insufficient") || start.includes("upstream") || start.includes("overloaded");
 }
 
-export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
+async function _callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
   const temperature = opts.temperature ?? DEFAULT_TEMPERATURE;
 
   if (!opts.env.GEMINI_API_KEY) {
@@ -208,11 +208,7 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
 
   let result: CallLLMResult | null = null;
 
-  if (opts.env.AI) {
-    result = await tryWorkersAI(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
-    if (isErrorContent(result?.text)) result = null;
-  }
-  if (!result && opts.env.OPENROUTER_API_KEY) {
+  if (opts.env.OPENROUTER_API_KEY) {
     result = await tryOpenRouter(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
     if (isErrorContent(result?.text)) result = null;
   }
@@ -224,6 +220,10 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
     result = await tryDirectGemini(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
     if (isErrorContent(result?.text)) result = null;
   }
+  if (!result && opts.env.AI) {
+    result = await tryWorkersAI(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
+    if (isErrorContent(result?.text)) result = null;
+  }
 
   if (result) return result;
 
@@ -233,4 +233,18 @@ export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
     provider: null,
     route: null,
   };
+}
+
+const LLM_CALL_TIMEOUT_MS = 60000;
+
+export async function callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
+  return Promise.race([
+    _callLLM(opts),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), LLM_CALL_TIMEOUT_MS)),
+  ]).catch(() => ({
+    ok: false,
+    error: "All LLM providers failed",
+    provider: null,
+    route: null,
+  }));
 }

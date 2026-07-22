@@ -209,7 +209,16 @@ function getRoom(env: Env, id: string): DurableObjectStub<IncidentRoom> {
 }
 
 function getAgentStub(ns: DurableObjectNamespace): DurableObjectStub {
-  return ns.get(ns.idFromName("v17"));
+  return ns.get(ns.idFromName("v19"));
+}
+
+export const RPC_TIMEOUT = { agent: 60000, transition: 10000, query: 10000, chain: 180000 };
+
+export async function rpcTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`RPC timeout: ${label} after ${ms}ms`)), ms)),
+  ]);
 }
 
 export default class extends WorkerEntrypoint<Env> {
@@ -516,12 +525,14 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("NOT_FOUND", "Incident not found", 404);
       }
 
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       if (state.state !== "Ingested" && state.state !== "TimelineDone") {
         return jsonError("CONFLICT", "Incident is in state \"" + state.state + "\", expected \"Ingested\" or \"TimelineDone\"", 409);
       }
 
-      this.ctx.waitUntil(this.runFullChain(incidentId, requestId));
+      this.ctx.waitUntil(rpcTimeout(this.runFullChain(incidentId, requestId), RPC_TIMEOUT.chain, "FullChain").catch((err) => {
+        logJson(incidentId, requestId, "CoreApi", 0, "completed", "failure", "Full chain timed out: " + (err instanceof Error ? err.message : String(err)));
+      }));
 
       return json({
         data: {
@@ -538,12 +549,12 @@ export default class extends WorkerEntrypoint<Env> {
   private async runFullChain(incidentId: string, requestId: string): Promise<void> {
     try {
       const room = getRoom(this.env, incidentId);
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       const isRetrigger = state.state === "TimelineDone";
 
-      const eventsResult = await this.env.incidentiq_db.prepare(
+      const eventsResult = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT timestamp, detail, source FROM incident_events WHERE incident_id = ? ORDER BY created_at ASC"
-      ).bind(incidentId).all();
+      ).bind(incidentId).all(), RPC_TIMEOUT.query, "D1 events query");
 
       const rawEvents = (eventsResult.results ?? []).map((e: any) => ({
         timestamp: e.timestamp ?? null,
@@ -555,7 +566,7 @@ export default class extends WorkerEntrypoint<Env> {
       const t0 = performance.now();
       logJson(incidentId, requestId, "CoreApi", state.version, "started", "pending", "Calling TimelineAgent");
       const timelineStub = getAgentStub(this.env.TIMELINE_AGENT) as unknown as TimelineAgentRPC;
-      const timelineResult: any = await timelineStub.generateTimeline({ incident_id: incidentId, request_id: requestId, raw_events: rawEvents });
+      const timelineResult: any = await rpcTimeout(timelineStub.generateTimeline({ incident_id: incidentId, request_id: requestId, raw_events: rawEvents }), RPC_TIMEOUT.agent, "TimelineAgent");
       const t1 = performance.now();
 
       if (timelineResult.status !== "success" || !timelineResult.timeline) {
@@ -569,23 +580,23 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       if (isRetrigger) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "DELETE FROM timeline_entries WHERE incident_id = ?"
-        ).bind(incidentId).run();
+        ).bind(incidentId).run(), RPC_TIMEOUT.query, "D1 delete timeline");
       }
 
       const now = new Date().toISOString();
       for (const entry of timelineResult.timeline) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO timeline_entries (id, incident_id, time, event, confidence, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).bind(crypto.randomUUID(), incidentId, entry.time, entry.event, entry.confidence, entry.note ?? null, now).run();
+        ).bind(crypto.randomUUID(), incidentId, entry.time, entry.event, entry.confidence, entry.note ?? null, now).run(), RPC_TIMEOUT.query, "D1 insert timeline");
       }
 
-      await (room as any).setAgentResult("timeline", timelineResult.timeline);
+      await rpcTimeout((room as any).setAgentResult("timeline", timelineResult.timeline), RPC_TIMEOUT.transition, "room.setAgentResult(timeline)");
 
       let currentVersion = state.version;
       if (!isRetrigger) {
-        const tResult: any = await room.transition("TimelineDone" as IncidentState);
+        const tResult: any = await rpcTimeout(room.transition("TimelineDone" as IncidentState), RPC_TIMEOUT.transition, "room.transition(TimelineDone)");
         if (tResult.success) currentVersion = tResult.version;
       }
 
@@ -605,11 +616,11 @@ export default class extends WorkerEntrypoint<Env> {
       const validation = validateTimeline(timelineResult.timeline, rawEvents);
 
       if (!validation.valid) {
-        await (room as any).setValidationStatus(validation.issues);
+        await rpcTimeout((room as any).setValidationStatus(validation.issues), RPC_TIMEOUT.transition, "room.setValidationStatus");
         const issuesSummary = validation.issues.map((i: any) => "- " + i.detail).join("\n");
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-        ).bind(crypto.randomUUID(), incidentId, "agent", issuesSummary, "validation", now).run();
+        ).bind(crypto.randomUUID(), incidentId, "agent", issuesSummary, "validation", now).run(), RPC_TIMEOUT.query, "D1 insert validation issue");
         logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "invalid",
           "Validation failed: " + validation.issues.map((i: any) => i.type + ": " + i.detail).join("; "),
           { latency_ms: Math.round(performance.now() - v0) });
@@ -621,10 +632,10 @@ export default class extends WorkerEntrypoint<Env> {
         return;
       }
 
-      const validatedTransition: any = await room.transition("Validated" as IncidentState);
+      const validatedTransition: any = await rpcTimeout(room.transition("Validated" as IncidentState), RPC_TIMEOUT.transition, "room.transition(Validated)");
       if (!validatedTransition.success) return;
       currentVersion = validatedTransition.version;
-      await (room as any).setValidationStatus(null);
+      await rpcTimeout((room as any).setValidationStatus(null), RPC_TIMEOUT.transition, "room.setValidationStatus(null)");
 
       logJson(incidentId, requestId, "CoreApi", currentVersion, "completed", "valid",
         "Validation passed: " + timelineResult.timeline.length + " timeline entries checked",
@@ -666,9 +677,9 @@ export default class extends WorkerEntrypoint<Env> {
       const rc0 = performance.now();
       logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling RootCauseAgent");
       const rcStub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
-      const rcResult: RootCauseOutput = await rcStub.analyzeRootCause({
+      const rcResult: RootCauseOutput = await rpcTimeout(rcStub.analyzeRootCause({
         incident_id: incidentId, request_id: requestId, timeline, retrieved_context,
-      });
+      }), RPC_TIMEOUT.agent, "RootCauseAgent");
       const rc1 = performance.now();
 
       if (rcResult.status !== "success" || !rcResult.cause) {
@@ -683,30 +694,30 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       if (isRetrigger) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "DELETE FROM root_causes WHERE incident_id = ?"
-        ).bind(incidentId).run();
+        ).bind(incidentId).run(), RPC_TIMEOUT.query, "D1 delete root_causes");
       }
 
       const rootCauseId = crypto.randomUUID();
-      await this.env.incidentiq_db.prepare(
+      await rpcTimeout(this.env.incidentiq_db.prepare(
         "INSERT OR REPLACE INTO root_causes (id, incident_id, cause, confidence, evidence, needs_review, provider_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       ).bind(
         rootCauseId, incidentId, rcResult.cause, rcResult.confidence ?? 0,
         rcResult.evidence ?? null, rcResult.needs_review ? 1 : 0,
         rcResult.provider_used ?? null, now,
-      ).run();
+      ).run(), RPC_TIMEOUT.query, "D1 insert root_causes");
 
-      await (room as any).setAgentResult("rootCause", {
+      await rpcTimeout((room as any).setAgentResult("rootCause", {
         id: rootCauseId,
         cause: rcResult.cause,
         confidence: rcResult.confidence ?? 0,
         evidence: rcResult.evidence ?? null,
         needs_review: rcResult.needs_review ? 1 : 0,
         provider_used: rcResult.provider_used ?? null,
-      });
+      }), RPC_TIMEOUT.transition, "room.setAgentResult(rootCause)");
 
-      const rcTransition: any = await room.transition("RootCauseDone" as IncidentState);
+      const rcTransition: any = await rpcTimeout(room.transition("RootCauseDone" as IncidentState), RPC_TIMEOUT.transition, "room.transition(RootCauseDone)");
       if (!rcTransition.success) return;
       currentVersion = rcTransition.version;
 
@@ -721,14 +732,14 @@ export default class extends WorkerEntrypoint<Env> {
       );
 
       // ---- STEP 4: Prevention Agent ----
-      const rootCauseRow = await this.env.incidentiq_db.prepare(
+      const rootCauseRow = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT cause, evidence FROM root_causes WHERE incident_id = ?"
-      ).bind(incidentId).first<{ cause: string; evidence: string | null }>();
+      ).bind(incidentId).first<{ cause: string; evidence: string | null }>(), RPC_TIMEOUT.query, "D1 query root_causes");
       if (!rootCauseRow) return;
 
       let preventionContext: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
       try {
-        const rawPreventionContext = await retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3);
+        const rawPreventionContext = await rpcTimeout(retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3), RPC_TIMEOUT.query, "KnowledgeRetrieval(prevention)");
         preventionContext = rawPreventionContext.map((c: any) => ({
           chunk_id: c.chunkId,
           title: c.title,
@@ -748,13 +759,13 @@ export default class extends WorkerEntrypoint<Env> {
       const p0 = performance.now();
       logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling PreventionAgent");
       const prevStub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
-      const prevResult: PreventionOutput = await prevStub.generatePrevention({
+      const prevResult: PreventionOutput = await rpcTimeout(prevStub.generatePrevention({
         incident_id: incidentId,
         request_id: requestId,
         root_cause: rootCauseRow.cause,
         root_cause_evidence: rootCauseRow.evidence ?? "",
         retrieved_context: preventionContext,
-      });
+      }), RPC_TIMEOUT.agent, "PreventionAgent");
       const p1 = performance.now();
 
       if (prevResult.status !== "success" || !prevResult.recommendations) {
@@ -769,18 +780,18 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       if (isRetrigger) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "DELETE FROM recommendations WHERE incident_id = ?"
-        ).bind(incidentId).run();
+        ).bind(incidentId).run(), RPC_TIMEOUT.query, "D1 delete recommendations");
       }
 
       for (const rec of prevResult.recommendations) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO recommendations (id, incident_id, recommendation, reference, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference ?? null, now).run();
+        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference ?? null, now).run(), RPC_TIMEOUT.query, "D1 insert recommendation");
       }
 
-      const prevTransition: any = await room.transition("PreventionDone" as IncidentState);
+      const prevTransition: any = await rpcTimeout(room.transition("PreventionDone" as IncidentState), RPC_TIMEOUT.transition, "room.transition(PreventionDone)");
       if (!prevTransition.success) return;
       currentVersion = prevTransition.version;
 
@@ -795,14 +806,14 @@ export default class extends WorkerEntrypoint<Env> {
       );
 
       // ---- STEP 5: Moderator Agent ----
-      const rcFull = await this.env.incidentiq_db.prepare(
+      const rcFull = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT cause, confidence, evidence, needs_review FROM root_causes WHERE incident_id = ?"
-      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>();
+      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>(), RPC_TIMEOUT.query, "D1 query root_causes");
       if (!rcFull) return;
 
-      const recsResult = await this.env.incidentiq_db.prepare(
+      const recsResult = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT recommendation, reference FROM recommendations WHERE incident_id = ? ORDER BY rowid ASC"
-      ).bind(incidentId).all();
+      ).bind(incidentId).all(), RPC_TIMEOUT.query, "D1 query recommendations");
 
       const recommendations = (recsResult.results ?? []).map((r: any) => ({
         recommendation: r.recommendation,
@@ -812,7 +823,7 @@ export default class extends WorkerEntrypoint<Env> {
       const m0 = performance.now();
       logJson(incidentId, requestId, "CoreApi", currentVersion, "started", "pending", "Calling ModeratorAgent");
       const modStub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
-      const modResult: ModeratorOutput = await modStub.generateReport({
+      const modResult: ModeratorOutput = await rpcTimeout(modStub.generateReport({
         incident_id: incidentId,
         request_id: requestId,
         timeline,
@@ -823,7 +834,7 @@ export default class extends WorkerEntrypoint<Env> {
           needs_review: rcFull.needs_review === 1,
         },
         recommendations,
-      });
+      }), RPC_TIMEOUT.agent, "ModeratorAgent");
       const m1 = performance.now();
 
       if (modResult.status !== "success" || !modResult.report) {
@@ -837,9 +848,9 @@ export default class extends WorkerEntrypoint<Env> {
         return;
       }
 
-      await (room as any).setAgentResult("report", modResult.report);
+      await rpcTimeout((room as any).setAgentResult("report", modResult.report), RPC_TIMEOUT.transition, "room.setAgentResult(report)");
 
-      const modTransition: any = await room.transition("AwaitReview" as IncidentState);
+      const modTransition: any = await rpcTimeout(room.transition("AwaitReview" as IncidentState), RPC_TIMEOUT.transition, "room.transition(AwaitReview)");
       if (!modTransition.success) return;
 
       const modLatency = Math.round(m1 - m0);
@@ -873,14 +884,14 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("NOT_FOUND", "Incident not found", 404);
       }
 
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       if (state.state !== "Validated") {
         return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "Validated"`, 409);
       }
 
-      const timelineResult = await this.env.incidentiq_db.prepare(
+      const timelineResult = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT time, event, confidence, note FROM timeline_entries WHERE incident_id = ? ORDER BY time ASC"
-      ).bind(incidentId).all();
+      ).bind(incidentId).all(), RPC_TIMEOUT.query, "D1 query timeline");
 
       const timeline = (timelineResult.results ?? []).map((e: any) => ({
         time: e.time,
@@ -896,7 +907,7 @@ export default class extends WorkerEntrypoint<Env> {
       const queryText = timeline.map((e: any) => e.event).join(" ");
       let retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
       try {
-        const rawContext = await retrieveRelevantKnowledge(queryText, this.env.incidentiq_db, this.env.AI, 3);
+        const rawContext = await rpcTimeout(retrieveRelevantKnowledge(queryText, this.env.incidentiq_db, this.env.AI, 3), RPC_TIMEOUT.query, "KnowledgeRetrieval(rootcause)");
         retrieved_context = rawContext.map((c: any) => ({
           chunk_id: c.chunkId,
           title: c.title,
@@ -914,9 +925,9 @@ export default class extends WorkerEntrypoint<Env> {
       let confidenceThresholdOverride: number | undefined;
       if (body?.user_id) {
         try {
-          const userRow = await this.env.incidentiq_db.prepare(
+          const userRow = await rpcTimeout(this.env.incidentiq_db.prepare(
             "SELECT preferences FROM users WHERE id = ?"
-          ).bind(body.user_id).first<{ preferences: string | null }>();
+          ).bind(body.user_id).first<{ preferences: string | null }>(), RPC_TIMEOUT.query, "D1 query users");
           if (userRow?.preferences) {
             const prefs = JSON.parse(userRow.preferences);
             if (typeof prefs.confidence_threshold_override === "number") {
@@ -927,13 +938,13 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       const stub = getAgentStub(this.env.ROOTCAUSE_AGENT) as unknown as RootCauseAgentRPC;
-      const result: RootCauseOutput = await stub.analyzeRootCause({
+      const result: RootCauseOutput = await rpcTimeout(stub.analyzeRootCause({
         incident_id: incidentId,
         request_id: requestId,
         timeline,
         retrieved_context,
         ...(confidenceThresholdOverride !== undefined ? { confidence_threshold_override: confidenceThresholdOverride } : {}),
-      });
+      }), RPC_TIMEOUT.agent, "RootCauseAgent");
 
       if (result.status !== "success" || !result.cause) {
         await logActivity(
@@ -945,24 +956,24 @@ export default class extends WorkerEntrypoint<Env> {
 
       const now = new Date().toISOString();
       const rootCauseId = crypto.randomUUID();
-      await this.env.incidentiq_db.prepare(
+      await rpcTimeout(this.env.incidentiq_db.prepare(
         "INSERT OR REPLACE INTO root_causes (id, incident_id, cause, confidence, evidence, needs_review, provider_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       ).bind(
         rootCauseId, incidentId, result.cause, result.confidence ?? 0,
         result.evidence ?? null, result.needs_review ? 1 : 0,
         result.provider_used ?? null, now,
-      ).run();
+      ).run(), RPC_TIMEOUT.query, "D1 insert root_causes");
 
-      await (room as any).setAgentResult("rootCause", {
+      await rpcTimeout((room as any).setAgentResult("rootCause", {
         id: rootCauseId,
         cause: result.cause,
         confidence: result.confidence ?? 0,
         evidence: result.evidence ?? null,
         needs_review: result.needs_review ? 1 : 0,
         provider_used: result.provider_used ?? null,
-      });
+      }), RPC_TIMEOUT.transition, "room.setAgentResult(rootCause)");
 
-      const transitionResult: any = await room.transition("RootCauseDone" as IncidentState);
+      const transitionResult: any = await rpcTimeout(room.transition("RootCauseDone" as IncidentState), RPC_TIMEOUT.transition, "room.transition(RootCauseDone)");
       if (!transitionResult.success) {
         return jsonError("INTERNAL", transitionResult.error ?? "State transition to RootCauseDone failed", 500);
       }
@@ -1005,21 +1016,21 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("NOT_FOUND", "Incident not found", 404);
       }
 
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       if (state.state !== "RootCauseDone") {
         return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "RootCauseDone"`, 409);
       }
 
-      const rootCauseRow = await this.env.incidentiq_db.prepare(
+      const rootCauseRow = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT cause, evidence FROM root_causes WHERE incident_id = ?"
-      ).bind(incidentId).first<{ cause: string; evidence: string | null }>();
+      ).bind(incidentId).first<{ cause: string; evidence: string | null }>(), RPC_TIMEOUT.query, "D1 query root_causes");
       if (!rootCauseRow) {
         return jsonError("CONFLICT", "No root cause found. Run /analyze-rootcause first.", 409);
       }
 
       let retrieved_context: Array<{ chunk_id: string; title: string; content: string; score: number }> = [];
       try {
-        const rawContext = await retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3);
+        const rawContext = await rpcTimeout(retrieveRelevantKnowledge(rootCauseRow.cause, this.env.incidentiq_db, this.env.AI, 3), RPC_TIMEOUT.query, "KnowledgeRetrieval(prevention)");
         retrieved_context = rawContext.map((c: any) => ({
           chunk_id: c.chunkId, title: c.title, content: c.content, score: c.score,
         }));
@@ -1032,13 +1043,13 @@ export default class extends WorkerEntrypoint<Env> {
       }
 
       const stub = getAgentStub(this.env.PREVENTION_AGENT) as unknown as PreventionAgentRPC;
-      const result: PreventionOutput = await stub.generatePrevention({
+      const result: PreventionOutput = await rpcTimeout(stub.generatePrevention({
         incident_id: incidentId,
         request_id: requestId,
         root_cause: rootCauseRow.cause,
         root_cause_evidence: rootCauseRow.evidence ?? "",
         retrieved_context,
-      });
+      }), RPC_TIMEOUT.agent, "PreventionAgent");
 
       if (result.status !== "success" || !result.recommendations || result.recommendations.length === 0) {
         await logActivity(
@@ -1050,12 +1061,12 @@ export default class extends WorkerEntrypoint<Env> {
 
       const now = new Date().toISOString();
       for (const rec of result.recommendations) {
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO recommendations (id, incident_id, recommendation, reference, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference, now).run();
+        ).bind(crypto.randomUUID(), incidentId, rec.recommendation, rec.reference, now).run(), RPC_TIMEOUT.query, "D1 insert recommendation");
       }
 
-      const transitionResult: any = await room.transition("PreventionDone" as IncidentState);
+      const transitionResult: any = await rpcTimeout(room.transition("PreventionDone" as IncidentState), RPC_TIMEOUT.transition, "room.transition(PreventionDone)");
       if (!transitionResult.success) {
         return jsonError("INTERNAL", transitionResult.error ?? "State transition to PreventionDone failed", 500);
       }
@@ -1094,14 +1105,14 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("NOT_FOUND", "Incident not found", 404);
       }
 
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       if (state.state !== "PreventionDone") {
         return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "PreventionDone"`, 409);
       }
 
-      const timelineResult = await this.env.incidentiq_db.prepare(
+      const timelineResult = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT time, event, confidence, note FROM timeline_entries WHERE incident_id = ? ORDER BY time ASC"
-      ).bind(incidentId).all();
+      ).bind(incidentId).all(), RPC_TIMEOUT.query, "D1 query timeline");
 
       const timeline = (timelineResult.results ?? []).map((e: any) => ({
         time: e.time,
@@ -1114,17 +1125,17 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("CONFLICT", "No timeline entries found. Run /analyze first.", 409);
       }
 
-      const rootCauseRow = await this.env.incidentiq_db.prepare(
+      const rootCauseRow = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT cause, confidence, evidence, needs_review FROM root_causes WHERE incident_id = ?"
-      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>();
+      ).bind(incidentId).first<{ cause: string; confidence: number; evidence: string | null; needs_review: number }>(), RPC_TIMEOUT.query, "D1 query root_causes");
 
       if (!rootCauseRow) {
         return jsonError("CONFLICT", "No root cause found. Run /analyze-rootcause first.", 409);
       }
 
-      const recsResult = await this.env.incidentiq_db.prepare(
+      const recsResult = await rpcTimeout(this.env.incidentiq_db.prepare(
         "SELECT recommendation, reference FROM recommendations WHERE incident_id = ? ORDER BY rowid ASC"
-      ).bind(incidentId).all();
+      ).bind(incidentId).all(), RPC_TIMEOUT.query, "D1 query recommendations");
 
       const recommendations = (recsResult.results ?? []).map((r: any) => ({
         recommendation: r.recommendation,
@@ -1132,7 +1143,7 @@ export default class extends WorkerEntrypoint<Env> {
       }));
 
       const stub = getAgentStub(this.env.MODERATOR_AGENT) as unknown as ModeratorAgentRPC;
-      const result: ModeratorOutput = await stub.generateReport({
+      const result: ModeratorOutput = await rpcTimeout(stub.generateReport({
         incident_id: incidentId,
         request_id: requestId,
         timeline,
@@ -1143,7 +1154,7 @@ export default class extends WorkerEntrypoint<Env> {
           needs_review: rootCauseRow.needs_review === 1,
         },
         recommendations,
-      });
+      }), RPC_TIMEOUT.agent, "ModeratorAgent");
 
       if (result.status !== "success" || !result.report) {
         await logActivity(
@@ -1153,9 +1164,9 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("AGENT_ERROR", result.error ?? "ModeratorAgent failed to generate report", 500);
       }
 
-      await (room as any).setAgentResult("report", result.report);
+      await rpcTimeout((room as any).setAgentResult("report", result.report), RPC_TIMEOUT.transition, "room.setAgentResult(report)");
 
-      const transitionResult: any = await room.transition("AwaitReview" as IncidentState);
+      const transitionResult: any = await rpcTimeout(room.transition("AwaitReview" as IncidentState), RPC_TIMEOUT.transition, "room.transition(AwaitReview)");
       if (!transitionResult.success) {
         return jsonError("INTERNAL", transitionResult.error ?? "State transition to AwaitReview failed", 500);
       }
@@ -1198,7 +1209,7 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("VALIDATION_ERROR", "approved (boolean) is required", 400);
       }
 
-      const state: any = await room.getState();
+      const state: any = await rpcTimeout(room.getState(), RPC_TIMEOUT.transition, "room.getState");
       if (state.state !== "AwaitReview") {
         return jsonError("CONFLICT", `Incident is in state "${state.state}", expected "AwaitReview"`, 409);
       }
@@ -1207,7 +1218,7 @@ export default class extends WorkerEntrypoint<Env> {
       const reviewId = crypto.randomUUID();
 
       if (body.approved) {
-        const reportData = await (room as any).getData().then((d: any) => d?.report ?? null);
+        const reportData = await rpcTimeout((room as any).getData().then((d: any) => d?.report ?? null), RPC_TIMEOUT.transition, "room.getData");
 
         let reportSummary = reportData?.summary ?? "";
         if (body.modifications && typeof body.modifications === "string") {
@@ -1216,24 +1227,24 @@ export default class extends WorkerEntrypoint<Env> {
         const verifiedLine = `Verified by ${body.reviewer_user_id} on ${now}`;
         reportSummary = reportSummary ? `${reportSummary}\n\n${verifiedLine}` : verifiedLine;
 
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO reviews (id, incident_id, reviewer_user_id, approved, modifications, target_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        ).bind(reviewId, incidentId, body.reviewer_user_id, 1, body.modifications ?? null, "Finalized", now).run();
+        ).bind(reviewId, incidentId, body.reviewer_user_id, 1, body.modifications ?? null, "Finalized", now).run(), RPC_TIMEOUT.query, "D1 insert reviews");
 
-        await this.env.incidentiq_db.prepare(
+        await rpcTimeout(this.env.incidentiq_db.prepare(
           "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
         ).bind(crypto.randomUUID(), incidentId, body.reviewer_user_id,
           body.modifications
             ? `Report approved with modifications: ${body.modifications}\n${verifiedLine}`
             : `Report approved. ${verifiedLine}`,
-          "review", now).run();
+          "review", now).run(), RPC_TIMEOUT.query, "D1 insert conversations");
 
-        await (room as any).setAgentResult("report", {
+        await rpcTimeout((room as any).setAgentResult("report", {
           ...(reportData ?? {}),
           summary: reportSummary,
-        });
+        }), RPC_TIMEOUT.transition, "room.setAgentResult(report)");
 
-        const transitionResult: any = await room.transition("Finalized" as IncidentState);
+        const transitionResult: any = await rpcTimeout(room.transition("Finalized" as IncidentState), RPC_TIMEOUT.transition, "room.transition(Finalized)");
         if (!transitionResult.success) {
           return jsonError("INTERNAL", transitionResult.error ?? "State transition to Finalized failed", 500);
         }
@@ -1273,19 +1284,19 @@ export default class extends WorkerEntrypoint<Env> {
         return jsonError("VALIDATION_ERROR", `Invalid target_state "${targetState}". Must be one of: TimelineDone, Validated, RootCauseDone`, 400);
       }
 
-      await this.env.incidentiq_db.prepare(
+      await rpcTimeout(this.env.incidentiq_db.prepare(
         "INSERT INTO reviews (id, incident_id, reviewer_user_id, approved, modifications, target_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      ).bind(reviewId, incidentId, body.reviewer_user_id, 0, body.modifications ?? null, targetState, now).run();
+      ).bind(reviewId, incidentId, body.reviewer_user_id, 0, body.modifications ?? null, targetState, now).run(), RPC_TIMEOUT.query, "D1 insert reviews");
 
-      await this.env.incidentiq_db.prepare(
+      await rpcTimeout(this.env.incidentiq_db.prepare(
         "INSERT INTO conversations (id, incident_id, author, message, message_type, created_at) VALUES (?, ?, ?, ?, ?, ?)"
       ).bind(crypto.randomUUID(), incidentId, body.reviewer_user_id,
         body.modifications
           ? `Report rejected. Target state: ${targetState}. Modifications requested: ${body.modifications}`
           : `Report rejected. Target state: ${targetState}.`,
-        "review", now).run();
+        "review", now).run(), RPC_TIMEOUT.query, "D1 insert conversations");
 
-      const transitionResult: any = await room.transition(targetState as IncidentState);
+      const transitionResult: any = await rpcTimeout(room.transition(targetState as IncidentState), RPC_TIMEOUT.transition, "room.transition(" + targetState + ")");
       if (!transitionResult.success) {
         return jsonError("INTERNAL", transitionResult.error ?? `State transition to ${targetState} failed`, 500);
       }
