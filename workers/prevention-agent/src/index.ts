@@ -77,11 +77,13 @@ function buildUserPrompt(input: PreventionInput): string {
   return `=== ROOT CAUSE ===\n${input.root_cause}\n\n=== EVIDENCE ===\n${input.root_cause_evidence}\n\n=== REFERENCE MATERIAL ===\n${contextStr || "(No reference material retrieved)"}`;
 }
 
-function deterministicPrevention(): Recommendation[] {
+function deterministicPrevention(input: PreventionInput): Recommendation[] {
+  const rcEvent = input.root_cause.slice(0, 200);
+  const refs = input.retrieved_context.map((c) => c.title).filter(Boolean).join("; ");
   return [
     {
-      recommendation: "Review and document the root cause: " + "insufficient data to generate specific recommendations",
-      reference: null,
+      recommendation: `Review the root cause and implement corrective measures. Events observed: ${rcEvent}${refs ? ` Reference material: ${refs}` : ""}`,
+      reference: refs || null,
     },
   ];
 }
@@ -110,7 +112,7 @@ export class PreventionAgent extends Agent<Env> {
         return llmResult;
       }
 
-      const fallback = deterministicPrevention();
+      const fallback = deterministicPrevention(input);
       const latency = performance.now() - startTime;
       logJson(input.incident_id, input.request_id, "PreventionAgent", 0, "completed", "success",
         `${fallback.length} recommendations (deterministic fallback)`,

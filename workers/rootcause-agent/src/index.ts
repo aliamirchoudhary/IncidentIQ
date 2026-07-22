@@ -95,10 +95,16 @@ function buildUserPrompt(input: RootCauseInput): string {
 }
 
 function deterministicRootCause(input: RootCauseInput): { cause: string; confidence: number; evidence: string; needs_review: boolean } {
+  const summary = input.timeline
+    .map((e) => `${e.event}`)
+    .join("; ");
+  const contextSummary = input.retrieved_context
+    .map((c) => `${c.title}`)
+    .join("; ");
   return {
-    cause: "Insufficient data to determine root cause",
+    cause: `Insufficient data to determine root cause. Timeline events observed: ${summary}`,
     confidence: 0.1,
-    evidence: `Timeline has ${input.timeline.length} events and ${input.retrieved_context.length} reference chunks. LLM was unavailable; deterministic analysis cannot determine root cause. Manual review required.`,
+    evidence: `Timeline has ${input.timeline.length} events; ${input.retrieved_context.length} reference chunks consulted. Events: ${summary}. Reference chunks: ${contextSummary || "(none)"}`,
     needs_review: true,
   };
 }
