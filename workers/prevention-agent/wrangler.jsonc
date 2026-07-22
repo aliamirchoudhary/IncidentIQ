@@ -19,9 +19,6 @@
       "new_sqlite_classes": ["PreventionAgent"]
     }
   ],
-  "ai": {
-    "binding": "AI"
-  },
   "observability": {
     "logs": {
       "enabled": true,

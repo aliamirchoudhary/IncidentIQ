@@ -5,7 +5,6 @@ interface Env {
   GEMINI_API_KEY: string;
   OPENROUTER_API_KEY?: string;
   CLOUDFLARE_API_TOKEN?: string;
-  AI?: any;
 }
 
 interface TimelineEntry {
@@ -168,7 +167,6 @@ export class ModeratorAgent extends Agent<Env> {
         GEMINI_API_KEY: this.env.GEMINI_API_KEY ?? "",
         OPENROUTER_API_KEY: this.env.OPENROUTER_API_KEY,
         CLOUDFLARE_API_TOKEN: this.env.CLOUDFLARE_API_TOKEN,
-        AI: this.env.AI,
       },
     });
 

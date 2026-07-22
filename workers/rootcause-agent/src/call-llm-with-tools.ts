@@ -157,26 +157,6 @@ async function tryOpenRouter(messages: LlmMessage[], tools: ToolDefinition[], ap
   return null;
 }
 
-async function tryWorkersAI(messages: LlmMessage[], ai: any): Promise<{ content: string | null; tool_calls: ToolCall[] | null } | null> {
-  if (!ai) return null;
-  try {
-    const result = await Promise.race([
-      ai.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
-        messages: messages.map(m => ({ role: m.role, content: m.content ?? "" })),
-        max_tokens: 2000,
-        temperature: 0.3,
-      }),
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10000)),
-    ]) as any;
-    const text = result?.response ?? "";
-    if (!text) return null;
-    if (text.length < 20) return null;
-    return { content: text, tool_calls: null };
-  } catch {
-    return null;
-  }
-}
-
 export interface FunctionCallResult {
   text: string;
   tool_invocations: ToolInvocation[];
@@ -194,7 +174,6 @@ async function _callLLMWithTools(
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
     CLOUDFLARE_API_TOKEN?: string;
-    AI?: any;
   },
 ): Promise<FunctionCallResult | { ok: false; error: string }> {
   if (!env.GEMINI_API_KEY) {
@@ -248,14 +227,6 @@ async function _callLLMWithTools(
     if (!isValidResponse(firstResponse)) firstResponse = null;
     provider = "gemini";
     route = "direct";
-  }
-  if (!isValidResponse(firstResponse) && env.AI) {
-    firstResponse = await tryWorkersAI(messages, env.AI);
-    if (isValidResponse(firstResponse)) {
-      provider = "workers-ai";
-      route = "direct";
-      model = "llama-3.1-8b";
-    }
   }
 
   if (!isValidResponse(firstResponse)) {
@@ -311,9 +282,6 @@ async function _callLLMWithTools(
         if (!isValidResponse(secondResponse)) secondResponse = null;
       }
     }
-    if (!isValidResponse(secondResponse) && env.AI) {
-      secondResponse = await tryWorkersAI(messages, env.AI);
-    }
 
     if (!secondResponse) {
       return { ok: false, error: "LLM failed on follow-up call after tool invocation" };
@@ -346,7 +314,6 @@ export async function callLLMWithTools(
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
     CLOUDFLARE_API_TOKEN?: string;
-    AI?: any;
   },
 ): Promise<FunctionCallResult | { ok: false; error: string }> {
   return Promise.race([

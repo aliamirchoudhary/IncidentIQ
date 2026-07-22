@@ -20,7 +20,6 @@ export interface CallLLMOptions {
     GEMINI_API_KEY: string;
     OPENROUTER_API_KEY?: string;
     CLOUDFLARE_API_TOKEN?: string;
-    AI?: any;
   };
 }
 
@@ -98,34 +97,6 @@ function logLLMEvent(event: string, provider: string, route: string, detail: str
     timestamp: new Date().toISOString(),
     ...extra,
   }));
-}
-
-async function tryWorkersAI(
-  systemPrompt: string, userPrompt: string, maxTokens: number, temperature: number,
-  env: { AI?: any },
-): Promise<CallLLMResult | null> {
-  if (!env.AI) return null;
-  const t0 = performance.now();
-  try {
-    const result = await Promise.race([
-      env.AI.run("@cf/meta/llama-3.1-8b-instruct-fp8", {
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        max_tokens: maxTokens,
-        temperature,
-        stream: false,
-      }) as Promise<{ response?: string; choices?: Array<{ message?: { content?: string } }> }>,
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10000)),
-    ]);
-    const text = result.response || result.choices?.[0]?.message?.content || "";
-    logLLMEvent("completed", "workers-ai", "direct", "Workers AI call succeeded", { latency_ms: Math.round(performance.now() - t0) });
-    return { text, provider: "workers-ai", route: "direct", model: "@cf/meta/llama-3.1-8b-instruct-fp8" };
-  } catch (err) {
-    logLLMEvent("completed", "workers-ai", "direct", "Workers AI call failed: " + (err instanceof Error ? err.message : String(err)), { latency_ms: Math.round(performance.now() - t0) });
-    return null;
-  }
 }
 
 async function tryGateway(
@@ -218,10 +189,6 @@ async function _callLLM(opts: CallLLMOptions): Promise<CallLLMResponse> {
   }
   if (!result) {
     result = await tryDirectGemini(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
-    if (isErrorContent(result?.text)) result = null;
-  }
-  if (!result && opts.env.AI) {
-    result = await tryWorkersAI(opts.systemPrompt, opts.userPrompt, opts.maxTokens, temperature, opts.env);
     if (isErrorContent(result?.text)) result = null;
   }
 
